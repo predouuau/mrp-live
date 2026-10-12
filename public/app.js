@@ -687,6 +687,8 @@ async function applyQuality() {
   for (const en of S.pcs.values()) {
     if (en.role === 'pub' && en.kind === 'screen' && en.o === S.me) en.pc.getSenders().forEach((s) => tuneSender(s, 'screen', S.me));
   }
+  // a prévia acompanha o novo fps
+  dropPreview();
   S.self.q = qualityLabel();
   pushState();
   render();
@@ -832,6 +834,84 @@ function renderMembers() {
   st.classList.toggle('live', S.self.live);
 }
 
+// ------------------------------------------------------------ diagnóstico
+// A cada 5s, durante uma transmissão, envia ao servidor números técnicos (nada
+// da imagem): fps, resolução, taxa, perdas, atraso e tipo de conexão de cada
+// envio/recepção. Servem para descobrir onde engasga numa chamada real.
+// Consulta: /diag?sala=<código da sala>
+const diagPrev = new WeakMap();
+
+async function pcDiag(en) {
+  const r = await en.pc.getStats();
+  let rtp = null;
+  let src = null;
+  let pair = null;
+  r.forEach((x) => {
+    if (x.kind === 'video' && (x.type === 'outbound-rtp' || x.type === 'inbound-rtp')) rtp = x;
+    if (x.type === 'media-source' && x.kind === 'video') src = x;
+    if (x.type === 'transport' && x.selectedCandidatePairId) pair = r.get(x.selectedCandidatePairId);
+  });
+  const o = {};
+  if (pair) {
+    const l = r.get(pair.localCandidateId);
+    const rm = r.get(pair.remoteCandidateId);
+    o.conexao = `${l ? l.candidateType : '?'}/${rm ? rm.candidateType : '?'}`; // relay = passou por TURN
+    if (pair.currentRoundTripTime != null) o.rtt_ms = Math.round(pair.currentRoundTripTime * 1000);
+  }
+  if (!rtp) return o;
+  const out = rtp.type === 'outbound-rtp';
+  const now = { t: performance.now(), bytes: out ? rtp.bytesSent : rtp.bytesReceived, frz: rtp.freezeCount || 0, lost: rtp.packetsLost || 0, rcv: rtp.packetsReceived || 0 };
+  const p = diagPrev.get(en.pc);
+  diagPrev.set(en.pc, now);
+  o.fps = rtp.framesPerSecond != null ? Math.round(rtp.framesPerSecond) : 0;
+  o.res = rtp.frameHeight ? `${rtp.frameHeight}p` : '-';
+  o.codec = (r.get(rtp.codecId) || {}).mimeType;
+  if (p) o.kbps = Math.round(((now.bytes - p.bytes) * 8) / (now.t - p.t));
+  if (out) {
+    o.limite = rtp.qualityLimitationReason; // bandwidth = internet, cpu = processador
+    if (rtp.framesEncoded) o.ms_por_quadro = +((rtp.totalEncodeTime / rtp.framesEncoded) * 1000).toFixed(1);
+    if (pair && pair.availableOutgoingBitrate) o.banda_disponivel_kbps = Math.round(pair.availableOutgoingBitrate / 1000);
+    if (src && src.framesPerSecond != null) o.captura_fps = Math.round(src.framesPerSecond);
+  } else {
+    if (p) {
+      o.travadas_5s = now.frz - p.frz;
+      const lost = now.lost - p.lost;
+      const got = now.rcv - p.rcv;
+      o.perda_pct = lost + got > 0 ? +((lost * 100) / (lost + got)).toFixed(1) : 0;
+    }
+    if (rtp.jitter != null) o.jitter_ms = Math.round(rtp.jitter * 1000);
+    if (rtp.jitterBufferEmittedCount) o.buffer_ms = Math.round((rtp.jitterBufferDelay / rtp.jitterBufferEmittedCount) * 1000);
+  }
+  return o;
+}
+
+setInterval(async () => {
+  if (!S.ws || !S.me) return;
+  const nickOf = (id) => (id === S.me ? S.nick : (S.peers.get(id) || {}).nick || id);
+  const envia = [];
+  const recebe = [];
+  for (const en of [...S.pcs.values()]) {
+    if (en.kind !== 'screen') continue;
+    try {
+      const o = await pcDiag(en);
+      if (en.role === 'pub') envia.push({ para: nickOf(en.peer), tela: en.o === S.me ? 'minha' : `${nickOf(en.o)} (repasse)`, ...o });
+      else recebe.push({ tela_de: nickOf(en.o), via: nickOf(en.peer), ...o });
+    } catch {}
+  }
+  if (!envia.length && !recebe.length && !S.self.live) return;
+  const v = S.screenStream && S.screenStream.getVideoTracks()[0];
+  send({
+    t: 'diag',
+    d: {
+      celular: IS_MOBILE,
+      nucleos: navigator.hardwareConcurrency,
+      transmitindo: S.self.live ? `${qualityLabel()} · ${v ? v.getSettings().displaySurface : '?'} · captura ${liveHealth.capture}fps` : undefined,
+      envia,
+      recebe,
+    },
+  });
+}, 5000);
+
 // ------------------------------------------------ saúde da minha transmissão
 // Mede quantos quadros por segundo a captura está entregando. Testado: ao
 // transmitir uma JANELA que fica coberta ou minimizada, o Windows/o próprio
@@ -886,15 +966,15 @@ function renderLiveBar() {
 // Tiles são reaproveitados entre renders (vídeos não são recriados)
 const tiles = new Map();
 
-// Prévia local leve: cópia da faixa reduzida para 540p/10fps. A transmissão
-// enviada aos amigos continua na qualidade escolhida.
+// Prévia local: cópia da faixa no mesmo fps da transmissão (fluida), mas em
+// 540p para pesar pouco. A transmissão enviada aos amigos continua na qualidade escolhida.
 function selfPreview() {
   if (!S.screenStream) return null;
   if (!S.previewStream) {
     const v = S.screenStream.getVideoTracks()[0];
     if (!v) return null;
     const c = v.clone();
-    c.applyConstraints({ width: { max: 960 }, height: { max: 540 }, frameRate: { max: 10 } }).catch(() => {});
+    c.applyConstraints({ width: { max: 960 }, height: { max: 540 }, frameRate: { max: S.quality.fps } }).catch(() => {});
     S.previewStream = new MediaStream([c]);
   }
   return S.previewStream;
@@ -965,7 +1045,7 @@ function updateScreenTile(t, id) {
       <button class="t-btn" data-act="fullscreen" title="Tela cheia">${icon('full')}</button>
       <button class="t-btn stop" data-act="unwatch" data-id="${id}" title="Parar de assistir">${icon('x')} Parar de assistir</button>
     </div>
-    <div class="t-label">${icon('screen')}<span>${esc(p.nick)}${p.me ? ' (você)' : ''}</span><span class="live-badge">AO VIVO</span>${p.me ? '<span class="q">prévia leve · 10fps</span>' : '<span class="q live-stat"></span>'}</div>`);
+    <div class="t-label">${icon('screen')}<span>${esc(p.nick)}${p.me ? ' (você)' : ''}</span><span class="live-badge">AO VIVO</span>${p.me ? `<span class="q">sua prévia · 540p ${S.quality.fps}fps</span>` : '<span class="q live-stat"></span>'}</div>`);
   if (!p.me) showStat(t, id);
 }
 

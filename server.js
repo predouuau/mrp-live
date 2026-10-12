@@ -54,6 +54,13 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify(iceConfig()));
   }
+  // Diagnóstico técnico de uma sala (só quem tem o código da sala consegue ver)
+  if (urlPath === '/diag') {
+    const roomId = (new URLSearchParams(req.url.split('?')[1] || '').get('sala') || '').toLowerCase();
+    const d = diagStore.get(roomId);
+    res.writeHead(d ? 200 : 404, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify(d ? { sala: roomId, amostras: d.samples } : { erro: 'sem dados para esta sala' }));
+  }
   if (urlPath === '/' || urlPath === '') urlPath = '/index.html';
 
   const file = path.normalize(path.join(PUBLIC_DIR, urlPath));
@@ -225,6 +232,14 @@ setInterval(() => {
 // ---------- Salas ----------
 const rooms = new Map(); // roomId -> { peers: Map<id, peer>, chat: [] }
 
+// Diagnóstico: últimas amostras técnicas (fps, resolução, perdas...) de cada sala.
+// Fica guardado 30 min depois da última amostra, mesmo que a sala esvazie.
+const diagStore = new Map(); // roomId -> { updated, samples: [] }
+const DIAG_MAX = 400;
+setInterval(() => {
+  for (const [id, d] of diagStore) if (Date.now() - d.updated > 30 * 60 * 1000) diagStore.delete(id);
+}, 60 * 1000);
+
 function publicPeer(p) {
   return { id: p.id, nick: p.nick, live: p.live, cam: p.cam, q: p.q, watching: p.watching, relay: p.relay };
 }
@@ -338,6 +353,15 @@ function handleConnection(ws) {
         room.chat.push(msg);
         if (room.chat.length > CHAT_HISTORY) room.chat.shift();
         broadcast(room, { t: 'chat', msg });
+        break;
+      }
+      case 'diag': {
+        if (!m.d || typeof m.d !== 'object' || JSON.stringify(m.d).length > 8000) return;
+        let d = diagStore.get(peer.room);
+        if (!d) diagStore.set(peer.room, (d = { updated: 0, samples: [] }));
+        d.updated = Date.now();
+        d.samples.push({ hora: new Date().toISOString().slice(11, 19), nick: peer.nick, ...m.d });
+        if (d.samples.length > DIAG_MAX) d.samples.splice(0, d.samples.length - DIAG_MAX);
         break;
       }
       case 'relay': {
