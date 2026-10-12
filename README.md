@@ -36,7 +36,11 @@ TURN_URL=turn:seu-servidor:3478   TURN_USER=usuario   TURN_PASS=senha
 - **Ao parar de assistir, a conexão é fechada**, e o decodificador libera a CPU e a GPU.
 - **Câmera leve:** 640×360, 24 fps, 500 kbps, sem microfone.
 
-- **Árvore de retransmissão:** quem transmite envia no máximo 2 ou 3 cópias (2 em 1080p60, 3 nas demais qualidades). Cada espectador repassa para no máximo 2 outros. Com 6 pessoas, por exemplo, quem transmite envia só 2 cópias em vez de 5. Se alguém do meio da corrente sair, quem estava abaixo reconecta sozinho em poucos segundos.
+- **Até 5 espectadores recebem direto de quem transmite.** O upload (16 Mbps no total) é dividido entre eles para não saturar a conexão. Com 2 pessoas assistindo em 1080p60, cada uma recebe 7 Mbps. Com 5 pessoas, cada uma recebe cerca de 3,2 Mbps.
+- **Retransmissão só a partir do 6º espectador:** um espectador de PC repassa para até 2 outros, a até 3 Mbps. Celulares nunca retransmitem. Se quem retransmite sair, quem estava abaixo reconecta sozinho.
+- **A fluidez vem antes da nitidez:** se a rede ou o PC apertarem, a imagem perde um pouco de nitidez, mas os quadros por segundo se mantêm.
+- **Buffer de 120 ms para quem assiste:** absorve as oscilações da rede sem engasgar.
+- **Indicador no quadro:** mostra a resolução e o fps que estão chegando de verdade.
 
 | Qualidade | 30 fps    | 60 fps   |
 |-----------|-----------|----------|

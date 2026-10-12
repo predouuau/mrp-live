@@ -191,7 +191,7 @@ function relay(to, data) { send({ t: 'relay', to, data }); }
 function pushState() {
   const watching = S.watched.filter((id) => id !== S.me);
   S.sentWatching = watching.join(',');
-  send({ t: 'state', ...S.self, watching });
+  send({ t: 'state', ...S.self, relay: !IS_MOBILE, watching });
 }
 
 function connect() {
@@ -284,13 +284,20 @@ async function handle(m) {
 }
 
 // ------------------------------------------------------------------ WebRTC
-// Árvore de retransmissão: quem transmite envia para poucas pessoas (originCap)
-// e cada espectador repassa para no máximo RELAY_CAP outras. Assim ninguém
-// precisa codificar/enviar uma cópia para a sala inteira.
+// Quem transmite atende até ORIGIN_DIRECT espectadores direto, dividindo o
+// upload entre eles (UPLOAD_BUDGET) para não saturar a conexão. Só a partir daí
+// entra a retransmissão: um espectador de PC repassa para até RELAY_CAP outros.
+// Retransmitir obriga a decodificar e codificar de novo, por isso é o último
+// recurso e celulares nunca retransmitem.
 //
 // Chaves: sub:<tipo>:<origem>              → o que eu recebo (de quem quer que seja)
 //         pub:<tipo>:<origem>:<espectador> → o que eu envio/repasso
+const ORIGIN_DIRECT = 5;
+const UPLOAD_BUDGET = 16_000_000;
+const MIN_SCREEN_BR = 1_500_000;
 const RELAY_CAP = 2;
+const RELAY_BR_MAX = 3_000_000;
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent);
 const subKey = (kind, o) => `sub:${kind}:${o}`;
 const pubKey = (kind, o, viewer) => `pub:${kind}:${o}:${viewer}`;
 const rid = () => Math.random().toString(36).slice(2, 10);
@@ -300,12 +307,51 @@ function closePc(k) {
   if (!en) return;
   S.pcs.delete(k);
   try { en.pc.close(); } catch {}
+  // saiu um espectador da minha tela: os que ficaram ganham mais banda
+  if (en.role === 'pub' && en.kind === 'screen' && en.o === S.me) setTimeout(retuneOwnScreen, 0);
 }
 
-// Quantas pessoas a origem atende direto: mantém o upload em ~16 Mbps no máximo
-function originCap() {
-  const br = QUALITY[S.quality.res].br[S.quality.fps];
-  return Math.max(1, Math.min(3, Math.floor(16_000_000 / br)));
+// Taxa de bits de cada cópia da tela de `o` que eu envio
+function screenBitrate(o) {
+  const q = qualityOf(o);
+  const full = QUALITY[q.res].br[q.fps];
+  if (o !== S.me) return Math.min(full, RELAY_BR_MAX);
+  const n = Math.max(1, children('screen', S.me).length);
+  return Math.max(MIN_SCREEN_BR, Math.min(full, Math.floor(UPLOAD_BUDGET / n)));
+}
+
+// O WebRTC começa a ~300 kbps e sobe aos poucos (a imagem ficava ~15s em 540p).
+// Indica ao Chrome uma taxa inicial alta para a transmissão já começar nítida;
+// se a internet não aguentar, ele reduz sozinho em seguida.
+function fastStart(sdp, maxBps) {
+  const kbps = Math.round(maxBps / 1000);
+  const extra = `x-google-start-bitrate=${kbps}`;
+  const lines = sdp.split('\r\n');
+  const pts = new Set();
+  for (const l of lines) {
+    const m = /^a=rtpmap:(\d+) (VP8|VP9|H264|AV1)\//i.exec(l);
+    if (m) pts.add(m[1]);
+  }
+  const hasFmtp = new Set();
+  const out = lines.map((l) => {
+    const m = /^a=fmtp:(\d+) (.*)$/.exec(l);
+    if (m && pts.has(m[1]) && !m[2].includes('x-google-start-bitrate')) {
+      hasFmtp.add(m[1]);
+      return `${l};${extra}`;
+    }
+    return l;
+  });
+  const final = [];
+  for (const l of out) {
+    final.push(l);
+    const m = /^a=rtpmap:(\d+) /.exec(l);
+    if (m && pts.has(m[1]) && !hasFmtp.has(m[1])) final.push(`a=fmtp:${m[1]} ${extra}`);
+  }
+  return final.join('\r\n');
+}
+
+function retuneOwnScreen() {
+  for (const en of children('screen', S.me)) en.pc.getSenders().forEach((s) => tuneSender(s, 'screen', S.me));
 }
 
 function qualityOf(o) {
@@ -320,12 +366,14 @@ function preferCodecs(transceiver) {
   try {
     const caps = RTCRtpSender.getCapabilities('video');
     if (!caps) return;
+    // VP8 primeiro: testado no Chrome com placa AMD, o codificador H.264 por hardware
+    // acumulava atraso (até 88 ms por quadro) e derrubava a transmissão para 11-16fps.
+    // O VP8 manteve 58-60fps estáveis a ~5 ms por quadro e é leve de decodificar
+    // para quem assiste (inclusive celular). H.264 fica só como último recurso.
+    const order = ['video/vp8', 'video/vp9', 'video/h264'];
     const rank = (c) => {
-      const t = c.mimeType.toLowerCase();
-      if (t === 'video/h264') return 0;
-      if (t === 'video/vp8') return 1;
-      if (t === 'video/vp9') return 2;
-      return 3;
+      const i = order.indexOf(c.mimeType.toLowerCase());
+      return i < 0 ? order.length : i;
     };
     const codecs = [...caps.codecs].sort((a, b) => rank(a) - rank(b));
     transceiver.setCodecPreferences(codecs);
@@ -341,12 +389,13 @@ async function tuneSender(sender, kind, o) {
     enc.maxBitrate = 128_000;
   } else if (kind === 'screen') {
     const q = qualityOf(o);
-    enc.maxBitrate = QUALITY[q.res].br[q.fps];
+    enc.maxBitrate = screenBitrate(o);
     enc.maxFramerate = q.fps;
     enc.scaleResolutionDownBy = 1;
     enc.priority = 'high';
     enc.networkPriority = 'high';
-    p.degradationPreference = q.fps >= 60 ? 'maintain-framerate' : 'balanced';
+    // Fluidez em primeiro lugar: se apertar, reduz a nitidez, nunca os quadros
+    p.degradationPreference = 'maintain-framerate';
   } else {
     enc.maxBitrate = CAM.br;
     enc.maxFramerate = CAM.fps;
@@ -379,6 +428,8 @@ function subscribe(kind, o, via = o) {
   const en = { pc, kind, o, peer: via, role: 'sub', sid, stream: null, q: [], waiters: [] };
   S.pcs.set(k, en);
   pc.ontrack = (e) => {
+    // Pequeno buffer de reprodução: absorve oscilações da rede em vez de engasgar
+    try { if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = kind === 'screen' ? 120 : 60; } catch {}
     if (!en.stream) en.stream = e.streams[0] || new MediaStream();
     if (!en.stream.getTracks().includes(e.track)) en.stream.addTrack(e.track);
     // atende quem estava esperando eu receber a imagem (após todas as faixas chegarem)
@@ -439,11 +490,15 @@ async function onSubRequest(kind, o, viewer, sid) {
 
   closePc(pubKey(kind, o, viewer));
   const kids = children(kind, o);
-  const cap = kind === 'cam' ? Infinity : o === S.me ? originCap() : RELAY_CAP;
+  const cap = kind === 'cam' ? Infinity : o === S.me ? ORIGIN_DIRECT : RELAY_CAP;
   if (kids.length >= cap) {
-    const target = kids.sort((a, b) => a.redirects - b.redirects)[0];
-    target.redirects++;
-    return relay(viewer, { k: 'redirect', kind, o, sid, via: target.peer });
+    // Só indica quem pode retransmitir (PC, não celular). Se ninguém puder, atende direto.
+    const able = kids.filter((c) => (S.peers.get(c.peer) || {}).relay !== false);
+    if (able.length) {
+      const target = able.sort((a, b) => a.redirects - b.redirects)[0];
+      target.redirects++;
+      return relay(viewer, { k: 'redirect', kind, o, sid, via: target.peer });
+    }
   }
   await publish(kind, o, viewer, sid, stream);
 }
@@ -470,7 +525,9 @@ async function publish(kind, o, viewer, sid, stream) {
   const offer = await pc.createOffer();
   if (S.pcs.get(k) !== en) return;
   await pc.setLocalDescription(offer);
-  for (const s of pc.getSenders()) tuneSender(s, kind, o);
+  // Minha tela: redistribui a banda entre todos os espectadores diretos
+  if (kind === 'screen' && o === S.me) retuneOwnScreen();
+  else for (const s of pc.getSenders()) tuneSender(s, kind, o);
   relay(viewer, { k: 'offer', kind, o, sid, sdp: pc.localDescription.toJSON() });
 }
 
@@ -532,6 +589,7 @@ async function onSignal(from, d) {
     case 'answer': {
       const en = myPub();
       if (!en) return;
+      if (kind === 'screen') d.sdp.sdp = fastStart(d.sdp.sdp, screenBitrate(o));
       await en.pc.setRemoteDescription(d.sdp);
       await flushIce(en);
       break;
@@ -615,8 +673,9 @@ async function startLive() {
 function setupScreenTrack(stream) {
   const v = stream.getVideoTracks()[0];
   if (!v) return;
-  // "motion" prioriza fluidez (60fps); "detail" prioriza nitidez de texto (30fps)
-  try { v.contentHint = S.quality.fps >= 60 ? 'motion' : 'detail'; } catch {}
+  // "motion" em qualquer fps: prioriza fluidez. Em "detail" o codificador
+  // descarta quadros para manter o texto nítido, o que parece travamento.
+  try { v.contentHint = 'motion'; } catch {}
   v.onended = () => { if (S.screenStream === stream) stopLive(); };
 }
 
@@ -624,7 +683,7 @@ async function applyQuality() {
   const v = S.screenStream && S.screenStream.getVideoTracks()[0];
   if (!v) return;
   try { await v.applyConstraints(captureConstraints()); } catch {}
-  try { v.contentHint = S.quality.fps >= 60 ? 'motion' : 'detail'; } catch {}
+  try { v.contentHint = 'motion'; } catch {}
   for (const en of S.pcs.values()) {
     if (en.role === 'pub' && en.kind === 'screen' && en.o === S.me) en.pc.getSenders().forEach((s) => tuneSender(s, 'screen', S.me));
   }
@@ -768,9 +827,45 @@ function renderMembers() {
   const n = participants().length;
   $('#headInfo').textContent = `${n} ${n === 1 ? 'pessoa' : 'pessoas'} na sala`;
   const st = $('#meStatus');
-  st.textContent = S.self.live ? `Ao vivo · ${S.self.q} · ${viewersOf(S.me)} assistindo` : 'Online';
+  const cap = liveHealth.capture != null ? ` · captura ${liveHealth.capture}fps` : '';
+  st.textContent = S.self.live ? `Ao vivo · ${S.self.q}${cap} · ${viewersOf(S.me)} assistindo` : 'Online';
   st.classList.toggle('live', S.self.live);
 }
+
+// ------------------------------------------------ saúde da minha transmissão
+// Mede quantos quadros por segundo a captura está entregando. Testado: ao
+// transmitir uma JANELA que fica coberta ou minimizada, o Windows/o próprio
+// programa para de desenhá-la e a captura cai para ~1fps (parece congelado).
+const liveHealth = { capture: null, low: 0, warnedAt: 0, last: null };
+
+setInterval(async () => {
+  const v = S.screenStream && S.screenStream.getVideoTracks()[0];
+  if (!v) { liveHealth.capture = null; liveHealth.low = 0; liveHealth.last = null; return; }
+  let fps = null;
+  const en = children('screen', S.me)[0];
+  if (en) {
+    try {
+      const s = en.pc.getSenders().find((x) => x.track && x.track.kind === 'video');
+      (await s.getStats()).forEach((r) => { if (r.type === 'media-source' && r.framesPerSecond != null) fps = r.framesPerSecond; });
+    } catch {}
+  }
+  if (fps == null && v.stats && typeof v.stats.totalFrames === 'number') {
+    // ninguém assistindo: usa o contador do próprio track (Chrome)
+    const now = { t: performance.now(), n: v.stats.totalFrames };
+    if (liveHealth.last) fps = Math.round(((now.n - liveHealth.last.n) * 1000) / (now.t - liveHealth.last.t));
+    liveHealth.last = now;
+  }
+  if (fps == null) return;
+  liveHealth.capture = Math.round(fps);
+
+  const surface = (v.getSettings && v.getSettings().displaySurface) || '';
+  liveHealth.low = surface === 'window' && fps < 4 ? liveHealth.low + 1 : 0;
+  if (liveHealth.low >= 3 && Date.now() - liveHealth.warnedAt > 60000) {
+    liveHealth.warnedAt = Date.now();
+    toast('A janela que você está transmitindo parou de ser desenhada (está coberta ou minimizada) e a transmissão congela. Deixe-a visível na tela ou transmita a "Tela inteira".', 9000);
+  }
+  renderMembers();
+}, 2000);
 
 function renderLiveBar() {
   const bar = $('#liveBar');
@@ -870,8 +965,34 @@ function updateScreenTile(t, id) {
       <button class="t-btn" data-act="fullscreen" title="Tela cheia">${icon('full')}</button>
       <button class="t-btn stop" data-act="unwatch" data-id="${id}" title="Parar de assistir">${icon('x')} Parar de assistir</button>
     </div>
-    <div class="t-label">${icon('screen')}<span>${esc(p.nick)}${p.me ? ' (você)' : ''}</span><span class="live-badge">AO VIVO</span>${p.me ? '<span class="q">prévia leve · 10fps</span>' : p.q ? `<span class="q">${esc(p.q)}</span>` : ''}</div>`);
+    <div class="t-label">${icon('screen')}<span>${esc(p.nick)}${p.me ? ' (você)' : ''}</span><span class="live-badge">AO VIVO</span>${p.me ? '<span class="q">prévia leve · 10fps</span>' : '<span class="q live-stat"></span>'}</div>`);
+  if (!p.me) showStat(t, id);
 }
+
+// Mostra no quadro o que está chegando de verdade (resolução e fps recebidos).
+// Obs.: com a tela parada o navegador envia menos quadros; isso é normal.
+function showStat(t, id) {
+  const el = t.querySelector('.live-stat');
+  if (!el) return;
+  const en = S.pcs.get(subKey('screen', id));
+  el.textContent = en && en.stat ? en.stat : (info(id).q || '');
+}
+
+setInterval(async () => {
+  for (const en of [...S.pcs.values()]) {
+    if (en.role !== 'sub' || en.kind !== 'screen') continue;
+    try {
+      const report = await en.pc.getStats();
+      report.forEach((r) => {
+        if (r.type === 'inbound-rtp' && r.kind === 'video' && r.frameHeight) {
+          en.stat = `${r.frameHeight}p · ${Math.round(r.framesPerSecond || 0)}fps`;
+        }
+      });
+      const t = tiles.get(`s:${en.o}`);
+      if (t) showStat(t, en.o);
+    } catch {}
+  }
+}, 2000);
 
 function updatePersonTile(t, id) {
   const p = info(id);
@@ -1071,7 +1192,7 @@ function openLiveModal() {
   $('#liveTitle').textContent = live ? 'Sua transmissão' : 'Transmitir tela';
   $('#liveDesc').textContent = live
     ? `Ao vivo em ${qualityLabel()} para ${viewersOf(S.me)} ${viewersOf(S.me) === 1 ? 'pessoa' : 'pessoas'}. Ajuste a qualidade ou troque o que está sendo compartilhado.`
-    : 'Escolha a qualidade. Em seguida, selecione a tela inteira, uma janela ou uma guia.';
+    : 'Escolha a qualidade. Em seguida, selecione a tela inteira, uma janela ou uma guia. Dica: "Tela inteira" e guias são as mais fluidas; uma janela coberta ou minimizada congela.';
   $('#audioRow').hidden = live;
   $('#optAudio').checked = S.quality.audio;
   syncSeg();

@@ -226,7 +226,7 @@ setInterval(() => {
 const rooms = new Map(); // roomId -> { peers: Map<id, peer>, chat: [] }
 
 function publicPeer(p) {
-  return { id: p.id, nick: p.nick, live: p.live, cam: p.cam, q: p.q, watching: p.watching };
+  return { id: p.id, nick: p.nick, live: p.live, cam: p.cam, q: p.q, watching: p.watching, relay: p.relay };
 }
 
 function broadcast(room, msg, exceptId) {
@@ -296,6 +296,7 @@ function handleConnection(ws) {
         cam: false,
         q: '',
         watching: [],
+        relay: true,
       };
       ws.send({
         t: 'joined',
@@ -322,6 +323,7 @@ function handleConnection(ws) {
       case 'state': {
         if (typeof m.live === 'boolean') peer.live = m.live;
         if (typeof m.cam === 'boolean') peer.cam = m.cam;
+        if (typeof m.relay === 'boolean') peer.relay = m.relay;
         if (Array.isArray(m.watching)) {
           peer.watching = m.watching.filter((s) => typeof s === 'string').slice(0, 4).map((s) => s.slice(0, 16));
         }
