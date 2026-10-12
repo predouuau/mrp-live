@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0b0d">
+  <title>MRP Live Room</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ ENTRADA ============ -->
+<section id="landing" class="landing">
+  <form id="joinForm" class="card" autocomplete="off">
+    <div class="brand">
+      <div class="logo"><i data-icon="logo"></i></div>
+      <h1>MRP <span>Live Room</span></h1>
+    </div>
+    <p class="sub">Compartilhe sua tela com seus amigos em tempo real.</p>
+    <div id="inviteBox" class="invite-box" hidden>
+      Você foi convidado para a sala <b id="inviteRoom"></b>
+    </div>
+    <label for="nick">SEU NICK</label>
+    <input id="nick" maxlength="24" placeholder="Digite o nick desejado" required>
+    <button id="mainBtn" class="btn primary big" type="submit">Criar sala</button>
+    <button id="altBtn" class="link-btn" type="button" hidden>ou criar uma nova sala</button>
+    <p id="secureWarn" class="warn" hidden></p>
+  </form>
+</section>
+
+<!-- ============ SALA ============ -->
+<section id="room" class="room" hidden>
+  <aside id="sidebar" class="sidebar">
+    <header class="side-head">
+      <div class="logo sm"><i data-icon="logo"></i></div>
+      <span>MRP Live Room</span>
+    </header>
+
+    <div class="side-scroll">
+      <div class="cat">SALA DE TRANSMISSÃO</div>
+      <div class="channel">
+        <i data-icon="speaker"></i>
+        <span id="chanName">sala</span>
+      </div>
+      <ul id="members" class="members"></ul>
+      <button class="invite-row" data-act="copy">
+        <i data-icon="userplus"></i> Convidar amigos <i data-icon="chev" class="chev"></i>
+      </button>
+    </div>
+
+    <div class="voice-status">
+      <div class="vs-text">
+        <div class="vs-title"><i data-icon="signal"></i> Conectado à sala</div>
+        <div class="vs-sub" id="vsSub"></div>
+      </div>
+      <button class="icon-btn" data-act="copy" title="Copiar link de convite"><i data-icon="link"></i></button>
+      <button class="icon-btn danger" data-act="leave" title="Sair da sala"><i data-icon="leave"></i></button>
+    </div>
+    <div class="side-actions">
+      <button class="side-btn" id="sideCam" data-act="cam"><i data-icon="cam"></i><span>Câmera</span></button>
+      <button class="side-btn" id="sideShare" data-act="share"><i data-icon="screen"></i><span>Tela</span></button>
+    </div>
+    <div class="user-panel">
+      <div id="meAvatar" class="avatar"></div>
+      <div class="up-text">
+        <div id="meNick" class="up-nick"></div>
+        <div id="meStatus" class="up-status">Online</div>
+      </div>
+    </div>
+  </aside>
+
+  <div id="sideShade" class="shade" data-act="toggle-side"></div>
+
+  <main class="main">
+    <header class="main-head">
+      <button class="icon-btn mobile-only" data-act="toggle-side" title="Participantes"><i data-icon="menu"></i></button>
+      <i data-icon="speaker" class="head-ic"></i>
+      <b id="headName"></b>
+      <span id="headInfo" class="head-info"></span>
+      <div class="head-right">
+        <button class="icon-btn" data-act="copy" title="Copiar link de convite"><i data-icon="link"></i></button>
+        <button class="icon-btn" data-act="toggle-chat" title="Chat"><i data-icon="chat"></i><span id="unread" class="badge" hidden></span></button>
+      </div>
+    </header>
+
+    <div id="liveBar" class="live-bar" hidden></div>
+    <section id="stage" class="stage"></section>
+    <div id="strip" class="strip" hidden></div>
+
+    <footer class="controls">
+      <button class="ctrl" id="btnCam" data-act="cam" title="Ligar câmera"><i data-icon="camoff"></i></button>
+      <button class="ctrl" id="btnShare" data-act="share" title="Transmitir tela"><i data-icon="screen"></i></button>
+      <button class="ctrl" id="btnChat" data-act="toggle-chat" title="Chat"><i data-icon="chat"></i></button>
+      <button class="ctrl leave" data-act="leave" title="Sair da sala"><i data-icon="leave"></i></button>
+    </footer>
+  </main>
+
+  <aside id="chat" class="chat">
+    <header class="chat-head">
+      <span class="hash">#</span> chat-da-sala
+      <button class="icon-btn" data-act="toggle-chat" title="Fechar chat"><i data-icon="x"></i></button>
+    </header>
+    <div id="msgs" class="msgs"></div>
+    <form id="chatForm" class="chat-form" autocomplete="off">
+      <input id="chatInput" maxlength="1000" placeholder="Conversar na sala">
+      <button type="submit" class="send" title="Enviar"><i data-icon="send"></i></button>
+    </form>
+  </aside>
+</section>
+
+<!-- ============ MODAL: IR AO VIVO ============ -->
+<div id="liveModal" class="modal" hidden>
+  <div class="modal-card">
+    <button class="icon-btn modal-x" data-act="close-modal" title="Fechar"><i data-icon="x"></i></button>
+    <h2 id="liveTitle">Transmitir tela</h2>
+    <p class="muted" id="liveDesc">Escolha a qualidade. Em seguida, selecione a tela inteira, uma janela ou uma guia.</p>
+    <div class="opt-label">RESOLUÇÃO</div>
+    <div class="seg" data-group="res">
+      <button type="button" data-v="480">480p</button>
+      <button type="button" data-v="720">720p</button>
+      <button type="button" data-v="1080">1080p</button>
+    </div>
+    <div class="opt-label">TAXA DE QUADROS</div>
+    <div class="seg" data-group="fps">
+      <button type="button" data-v="30">30 FPS</button>
+      <button type="button" data-v="60">60 FPS</button>
+    </div>
+    <label class="check" id="audioRow">
+      <input type="checkbox" id="optAudio" checked>
+      <span>Transmitir o som da tela/guia <small>(o microfone nunca é usado)</small></span>
+    </label>
+    <div class="modal-actions" id="modalActions"></div>
+  </div>
+</div>
+
+<!-- ============ MODAL: SALA CRIADA ============ -->
+<div id="linkModal" class="modal" hidden>
+  <div class="modal-card">
+    <button class="icon-btn modal-x" data-act="close-modal" title="Fechar"><i data-icon="x"></i></button>
+    <h2>Sala criada!</h2>
+    <p class="muted">Envie este link para seus amigos entrarem e assistirem.</p>
+    <div class="link-row">
+      <input id="linkInput" readonly>
+      <button class="btn primary" data-act="copy">Copiar</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" data-act="close-modal">Pronto</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>

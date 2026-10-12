@@ -1,0 +1,1082 @@
+/* MRP Live Room — cliente
+ *
+ * Arquitetura (pensada para gastar pouco do PC):
+ *  - WebRTC ponto a ponto. Cada transmissão (tela ou câmera) usa uma conexão
+ *    unidirecional própria: quem transmite sempre faz a oferta, quem assiste responde.
+ *  - A tela SÓ é enviada para quem clicou em "Assistir". Ninguém assistindo = nenhum
+ *    custo de codificação/upload além da captura.
+ *  - A captura já sai na resolução/FPS escolhidos (o navegador reduz na origem),
+ *    e o codec H.264 é priorizado porque costuma usar aceleração de hardware.
+ *  - Ao parar de assistir, a conexão é fechada e o decodificador é liberado.
+ */
+'use strict';
+
+// ---------------------------------------------------------------- utilidades
+const $ = (s, r = document) => r.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+const ICONS = {
+  logo: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 6.5v11l9-5.5z"/></svg>',
+  speaker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M16.5 9a4 4 0 0 1 0 6M19 6.5a8 8 0 0 1 0 11"/></svg>',
+  mute: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M17 9.5l5 5M22 9.5l-5 5"/></svg>',
+  cam: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="13" height="12" rx="2.5"/><path d="M15.5 10.5l6-3.5v10l-6-3.5"/></svg>',
+  camoff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="13" height="12" rx="2.5"/><path d="M15.5 10.5l6-3.5v10l-6-3.5M3 3l18 18"/></svg>',
+  screen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
+  screenstop: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4M9.5 8l5 5M14.5 8l-5 5"/></svg>',
+  leave: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-3.2 0-6.2.9-8.6 2.6-.6.4-.9 1.1-.8 1.8l.3 2c.1.8.9 1.3 1.7 1.1l3-.8c.6-.2 1-.7 1-1.3v-1.9c1.1-.4 2.2-.5 3.4-.5s2.3.1 3.4.5v1.9c0 .6.4 1.1 1 1.3l3 .8c.8.2 1.6-.3 1.7-1.1l.3-2c.1-.7-.2-1.4-.8-1.8C18.2 9.9 15.2 9 12 9z"/></svg>',
+  chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H9.5L4 20z"/></svg>',
+  link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></svg>',
+  eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>',
+  full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  menu: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>',
+  userplus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-6.5 7-6.5s7 2.5 7 6.5M19 8v6M16 11h6"/></svg>',
+  chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
+  signal: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="4" height="7" rx="1"/><rect x="10" y="9" width="4" height="12" rx="1"/><rect x="17" y="4" width="4" height="17" rx="1"/></svg>',
+  send: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 20.5l18-8.5L3 3.5 3 10l12 2-12 2z"/></svg>',
+};
+function icon(name) { return ICONS[name] || ''; }
+function hydrateIcons(root = document) {
+  root.querySelectorAll('i[data-icon]').forEach((i) => { i.innerHTML = icon(i.dataset.icon); });
+}
+
+const COLORS = ['#e3242b', '#a8161c', '#5d5d68', '#c2185b', '#3d3d46', '#ff5a5f', '#7b1f24', '#80808c'];
+function colorFor(nick) {
+  let h = 0;
+  for (const ch of nick) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return COLORS[h % COLORS.length];
+}
+function avatarHTML(nick, cls = 'avatar', live = false) {
+  const first = [...nick.trim()][0] || '?';
+  return `<div class="${cls}${live ? ' live' : ''}" style="background:${colorFor(nick)}">${esc(first)}</div>`;
+}
+
+function toast(text, ms = 3000) {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = text;
+  $('#toasts').appendChild(t);
+  setTimeout(() => t.remove(), ms);
+}
+
+function genRoomId() {
+  const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
+  const a = crypto.getRandomValues(new Uint8Array(8));
+  return [...a].map((n) => abc[n % abc.length]).join('');
+}
+
+// ------------------------------------------------------------- configuração
+const QUALITY = {
+  480: { w: 854, h: 480, br: { 30: 1_200_000, 60: 2_000_000 } },
+  720: { w: 1280, h: 720, br: { 30: 2_500_000, 60: 4_000_000 } },
+  1080: { w: 1920, h: 1080, br: { 30: 4_500_000, 60: 7_000_000 } },
+};
+const CAM = { w: 640, h: 360, fps: 24, br: 500_000 };
+const MAX_WATCH = 4;
+
+const S = {
+  ws: null,
+  me: null,
+  nick: '',
+  room: '',
+  peers: new Map(), // id -> {id, nick, live, cam, viewers, q}
+  self: { live: false, cam: false, viewers: 0, q: '' },
+  screenStream: null,
+  camStream: null,
+  quality: { res: '720', fps: 60, audio: true },
+  watched: [], // ids das telas que estou assistindo (pode incluir a minha)
+  pcs: new Map(), // `${role}:${kind}:${peerId}` -> entry
+  muted: new Set(), // telas que eu silenciei
+  chatOpen: window.innerWidth > 1100,
+  unread: 0,
+  leaving: false,
+  rtc: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
+  lastMsg: null,
+};
+
+const canShare = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+
+// ---------------------------------------------------------------- entrada
+function initLanding() {
+  hydrateIcons();
+  const params = new URLSearchParams(location.search);
+  const invited = (params.get('sala') || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const nickInput = $('#nick');
+  try { nickInput.value = localStorage.getItem('mrp-nick') || ''; } catch {}
+  try {
+    const q = JSON.parse(localStorage.getItem('mrp-quality') || 'null');
+    if (q && QUALITY[q.res] && (q.fps === 30 || q.fps === 60)) S.quality = { ...S.quality, ...q };
+  } catch {}
+
+  let mode = 'create';
+  if (invited.length >= 4) {
+    mode = 'join';
+    $('#inviteBox').hidden = false;
+    $('#inviteRoom').textContent = invited;
+    $('#mainBtn').textContent = 'Entrar na sala';
+    $('#altBtn').hidden = false;
+  }
+  $('#altBtn').onclick = () => {
+    mode = 'create';
+    $('#inviteBox').hidden = true;
+    $('#altBtn').hidden = true;
+    $('#mainBtn').textContent = 'Criar sala';
+    history.replaceState(null, '', location.pathname);
+  };
+
+  if (!window.isSecureContext) {
+    const w = $('#secureWarn');
+    w.hidden = false;
+    w.textContent = 'Atenção: o site precisa estar em HTTPS (ou localhost) para transmitir tela e câmera.';
+  }
+
+  $('#joinForm').onsubmit = (e) => {
+    e.preventDefault();
+    const nick = nickInput.value.trim().slice(0, 24);
+    if (!nick) return nickInput.focus();
+    try { localStorage.setItem('mrp-nick', nick); } catch {}
+    S.nick = nick;
+    S.room = mode === 'join' ? invited : genRoomId();
+    enterRoom(mode === 'create');
+  };
+  nickInput.focus();
+
+  fetch('/config.json').then((r) => r.json()).then((c) => { if (c && c.iceServers) S.rtc = c; }).catch(() => {});
+}
+
+function roomLink() {
+  return `${location.origin}${location.pathname}?sala=${S.room}`;
+}
+
+function enterRoom(created) {
+  S.leaving = false;
+  $('#landing').hidden = true;
+  $('#room').hidden = false;
+  history.replaceState(null, '', `?sala=${S.room}`);
+  document.title = `MRP Live Room — ${S.room}`;
+  $('#chanName').textContent = `Sala ${S.room}`;
+  $('#headName').textContent = `Sala ${S.room}`;
+  $('#vsSub').textContent = `MRP Live Room / ${S.room}`;
+  $('#meNick').textContent = S.nick;
+  $('#meAvatar').outerHTML = avatarHTML(S.nick, 'avatar" id="meAvatar');
+  $('#msgs').innerHTML = '';
+  S.lastMsg = null;
+  setChatOpen(S.chatOpen);
+  if (created) {
+    $('#linkInput').value = roomLink();
+    $('#linkModal').hidden = false;
+  }
+  connect();
+  render();
+}
+
+// ------------------------------------------------------------- sinalização
+function send(obj) {
+  if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(obj));
+}
+function relay(to, data) { send({ t: 'relay', to, data }); }
+function pushState() { send({ t: 'state', ...S.self }); }
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  S.ws = ws;
+  ws.onopen = () => send({ t: 'join', room: S.room, nick: S.nick });
+  ws.onmessage = (e) => {
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
+    handle(m).catch((err) => console.warn(err));
+  };
+  ws.onclose = () => {
+    if (S.ws !== ws || S.leaving) return;
+    resetConnections();
+    toast('Conexão perdida. Reconectando…');
+    setTimeout(() => { if (!S.leaving && S.ws === ws) connect(); }, 1500);
+  };
+}
+
+function resetConnections() {
+  for (const key of [...S.pcs.keys()]) closePc(key);
+  S.peers.clear();
+  S.watched = S.watched.filter((id) => id === S.me);
+  S.self.viewers = 0;
+  render();
+}
+
+async function handle(m) {
+  switch (m.t) {
+    case 'joined': {
+      const wasWatchingSelf = S.watched.includes(S.me);
+      S.me = m.id;
+      S.watched = wasWatchingSelf ? [S.me] : [];
+      S.peers.clear();
+      for (const p of m.peers) S.peers.set(p.id, p);
+      if (!$('#msgs').childElementCount) for (const msg of m.chat) addChat(msg, true);
+      sysMsg(`Você entrou na sala <b>${esc(S.room)}</b>`);
+      if (S.self.live || S.self.cam) pushState();
+      for (const p of S.peers.values()) if (p.cam) subscribe('cam', p.id);
+      render();
+      break;
+    }
+    case 'error':
+      toast(m.msg || 'Erro');
+      if (m.fatal) leaveRoom();
+      break;
+    case 'peer-join':
+      S.peers.set(m.peer.id, m.peer);
+      sysMsg(`<b>${esc(m.peer.nick)}</b> entrou na sala`);
+      if (m.peer.cam) subscribe('cam', m.peer.id);
+      render();
+      break;
+    case 'peer-state': {
+      const p = m.peer;
+      const prev = S.peers.get(p.id);
+      if (!prev) return;
+      S.peers.set(p.id, p);
+      if (!prev.cam && p.cam) subscribe('cam', p.id);
+      if (prev.cam && !p.cam) closePc(key('sub', 'cam', p.id));
+      if (!prev.live && p.live) sysMsg(`<b>${esc(p.nick)}</b> começou a transmitir`, true);
+      if (prev.live && !p.live) {
+        closePc(key('sub', 'screen', p.id));
+        S.watched = S.watched.filter((id) => id !== p.id);
+        sysMsg(`<b>${esc(p.nick)}</b> parou de transmitir`);
+      }
+      render();
+      break;
+    }
+    case 'peer-leave': {
+      const p = S.peers.get(m.id);
+      for (const k of [...S.pcs.keys()]) if (S.pcs.get(k).peer === m.id) closePc(k);
+      S.peers.delete(m.id);
+      S.watched = S.watched.filter((id) => id !== m.id);
+      updateViewers();
+      if (p) sysMsg(`<b>${esc(p.nick)}</b> saiu da sala`);
+      render();
+      break;
+    }
+    case 'chat':
+      addChat(m.msg);
+      break;
+    case 'relay':
+      await onSignal(m.from, m.data);
+      break;
+  }
+}
+
+// ------------------------------------------------------------------ WebRTC
+const key = (role, kind, peer) => `${role}:${kind}:${peer}`;
+
+function closePc(k) {
+  const en = S.pcs.get(k);
+  if (!en) return;
+  S.pcs.delete(k);
+  try { en.pc.close(); } catch {}
+}
+
+function preferCodecs(transceiver) {
+  // H.264 primeiro (geralmente codificado/decodificado por hardware = menos CPU)
+  if (!window.RTCRtpSender || !RTCRtpSender.getCapabilities || !transceiver.setCodecPreferences) return;
+  try {
+    const caps = RTCRtpSender.getCapabilities('video');
+    if (!caps) return;
+    const rank = (c) => {
+      const t = c.mimeType.toLowerCase();
+      if (t === 'video/h264') return 0;
+      if (t === 'video/vp8') return 1;
+      if (t === 'video/vp9') return 2;
+      return 3;
+    };
+    const codecs = [...caps.codecs].sort((a, b) => rank(a) - rank(b));
+    transceiver.setCodecPreferences(codecs);
+  } catch {}
+}
+
+async function tuneSender(sender, kind) {
+  if (!sender.track) return;
+  const p = sender.getParameters();
+  if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+  const enc = p.encodings[0];
+  if (sender.track.kind === 'audio') {
+    enc.maxBitrate = 128_000;
+  } else if (kind === 'screen') {
+    const q = QUALITY[S.quality.res];
+    enc.maxBitrate = q.br[S.quality.fps];
+    enc.maxFramerate = S.quality.fps;
+    enc.scaleResolutionDownBy = 1;
+    enc.priority = 'high';
+    enc.networkPriority = 'high';
+    p.degradationPreference = S.quality.fps >= 60 ? 'maintain-framerate' : 'balanced';
+  } else {
+    enc.maxBitrate = CAM.br;
+    enc.maxFramerate = CAM.fps;
+    p.degradationPreference = 'balanced';
+  }
+  try {
+    await sender.setParameters(p);
+  } catch {
+    // Alguns navegadores não aceitam degradationPreference: tenta sem
+    try { delete p.degradationPreference; await sender.setParameters(p); } catch {}
+  }
+}
+
+// Lado de quem ASSISTE: pede a transmissão e responde à oferta
+function subscribe(kind, pubId) {
+  const k = key('sub', kind, pubId);
+  if (S.pcs.has(k)) return;
+  const pc = new RTCPeerConnection(S.rtc);
+  const sid = Math.random().toString(36).slice(2, 10);
+  const en = { pc, kind, peer: pubId, role: 'sub', sid, stream: null, q: [] };
+  S.pcs.set(k, en);
+  pc.ontrack = (e) => {
+    if (!en.stream) en.stream = e.streams[0] || new MediaStream();
+    if (!en.stream.getTracks().includes(e.track)) en.stream.addTrack(e.track);
+    renderStage();
+  };
+  pc.onicecandidate = (e) => {
+    if (e.candidate) relay(pubId, { k: 'ice', kind, sid, from: 'sub', c: e.candidate.toJSON() });
+  };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState !== 'failed' || S.pcs.get(k) !== en) return;
+    closePc(k);
+    setTimeout(() => {
+      const p = S.peers.get(pubId);
+      if (!p) return;
+      if ((kind === 'screen' && p.live && S.watched.includes(pubId)) || (kind === 'cam' && p.cam)) subscribe(kind, pubId);
+      renderStage();
+    }, 1000);
+  };
+  relay(pubId, { k: 'sub', kind, sid });
+}
+
+function unsubscribe(kind, pubId) {
+  const k = key('sub', kind, pubId);
+  const en = S.pcs.get(k);
+  if (!en) return;
+  closePc(k);
+  relay(pubId, { k: 'unsub', kind, sid: en.sid });
+}
+
+// Lado de quem TRANSMITE: cria a conexão só para quem pediu
+async function publish(kind, viewerId, sid) {
+  const stream = kind === 'screen' ? S.screenStream : S.camStream;
+  if (!stream) return relay(viewerId, { k: 'nostream', kind, sid });
+  const k = key('pub', kind, viewerId);
+  closePc(k);
+  const pc = new RTCPeerConnection(S.rtc);
+  const en = { pc, kind, peer: viewerId, role: 'pub', sid, q: [] };
+  S.pcs.set(k, en);
+
+  for (const track of stream.getTracks()) {
+    const tr = pc.addTransceiver(track, { direction: 'sendonly', streams: [stream] });
+    if (track.kind === 'video') preferCodecs(tr);
+  }
+  pc.onicecandidate = (e) => {
+    if (e.candidate) relay(viewerId, { k: 'ice', kind, sid, from: 'pub', c: e.candidate.toJSON() });
+  };
+  pc.onconnectionstatechange = () => {
+    if (S.pcs.get(k) !== en) return;
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      closePc(k);
+      updateViewers();
+    }
+  };
+  updateViewers();
+
+  const offer = await pc.createOffer();
+  if (S.pcs.get(k) !== en) return;
+  await pc.setLocalDescription(offer);
+  for (const s of pc.getSenders()) tuneSender(s, kind);
+  relay(viewerId, { k: 'offer', kind, sid, sdp: pc.localDescription.toJSON() });
+}
+
+async function flushIce(en) {
+  for (const c of en.q.splice(0)) {
+    try { await en.pc.addIceCandidate(c); } catch {}
+  }
+}
+
+async function onSignal(from, d) {
+  if (!d || !d.kind || (d.kind !== 'screen' && d.kind !== 'cam')) return;
+  switch (d.k) {
+    case 'sub':
+      await publish(d.kind, from, d.sid);
+      break;
+    case 'unsub': {
+      const en = S.pcs.get(key('pub', d.kind, from));
+      if (en && en.sid === d.sid) {
+        closePc(key('pub', d.kind, from));
+        updateViewers();
+      }
+      break;
+    }
+    case 'nostream': {
+      const en = S.pcs.get(key('sub', d.kind, from));
+      if (en && en.sid === d.sid) {
+        closePc(key('sub', d.kind, from));
+        if (d.kind === 'screen') S.watched = S.watched.filter((id) => id !== from);
+        render();
+      }
+      break;
+    }
+    case 'offer': {
+      const en = S.pcs.get(key('sub', d.kind, from));
+      if (!en || en.sid !== d.sid) return;
+      await en.pc.setRemoteDescription(d.sdp);
+      await flushIce(en);
+      const answer = await en.pc.createAnswer();
+      await en.pc.setLocalDescription(answer);
+      relay(from, { k: 'answer', kind: d.kind, sid: d.sid, sdp: en.pc.localDescription.toJSON() });
+      break;
+    }
+    case 'answer': {
+      const en = S.pcs.get(key('pub', d.kind, from));
+      if (!en || en.sid !== d.sid) return;
+      await en.pc.setRemoteDescription(d.sdp);
+      await flushIce(en);
+      break;
+    }
+    case 'ice': {
+      const en = S.pcs.get(key(d.from === 'pub' ? 'sub' : 'pub', d.kind, from));
+      if (!en || en.sid !== d.sid) return;
+      if (en.pc.remoteDescription) {
+        try { await en.pc.addIceCandidate(d.c); } catch {}
+      } else en.q.push(d.c);
+      break;
+    }
+  }
+}
+
+function updateViewers() {
+  let n = 0;
+  for (const en of S.pcs.values()) if (en.role === 'pub' && en.kind === 'screen') n++;
+  if (n !== S.self.viewers) {
+    S.self.viewers = n;
+    pushState();
+    renderMembers();
+  }
+}
+
+function closeAllPub(kind) {
+  for (const [k, en] of [...S.pcs]) if (en.role === 'pub' && en.kind === kind) closePc(k);
+}
+
+// -------------------------------------------------------- tela (Go Live)
+function captureConstraints() {
+  const q = QUALITY[S.quality.res];
+  const fps = S.quality.fps;
+  return {
+    width: { ideal: q.w, max: q.w },
+    height: { ideal: q.h, max: q.h },
+    frameRate: { ideal: fps, max: fps },
+  };
+}
+function qualityLabel() { return `${S.quality.res}p ${S.quality.fps}fps`; }
+
+async function startLive() {
+  if (!canShare) return toast('Seu navegador não permite compartilhar a tela (use Chrome, Edge ou Firefox no PC).');
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: captureConstraints(),
+      audio: S.quality.audio ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false,
+      selfBrowserSurface: 'exclude',
+      surfaceSwitching: 'include',
+      systemAudio: 'include',
+      monitorTypeSurfaces: 'include',
+    });
+  } catch (err) {
+    if (err && err.name !== 'NotAllowedError' && err.name !== 'AbortError') toast('Não foi possível compartilhar a tela.');
+    return;
+  }
+  const old = S.screenStream;
+  S.screenStream = stream;
+  setupScreenTrack(stream);
+
+  if (old) {
+    // Troca de tela durante a transmissão: substitui as faixas sem derrubar quem assiste
+    for (const en of S.pcs.values()) {
+      if (en.role !== 'pub' || en.kind !== 'screen') continue;
+      for (const sender of en.pc.getSenders()) {
+        if (!sender.track) continue;
+        const nt = stream.getTracks().find((t) => t.kind === sender.track.kind);
+        if (nt) sender.replaceTrack(nt).then(() => tuneSender(sender, 'screen')).catch(() => {});
+      }
+    }
+    old.getTracks().forEach((t) => { t.onended = null; t.stop(); });
+  } else {
+    if (!S.watched.length) S.watched = [S.me];
+  }
+  S.self.live = true;
+  S.self.q = qualityLabel();
+  pushState();
+  render();
+}
+
+function setupScreenTrack(stream) {
+  const v = stream.getVideoTracks()[0];
+  if (!v) return;
+  // "motion" prioriza fluidez (60fps); "detail" prioriza nitidez de texto (30fps)
+  try { v.contentHint = S.quality.fps >= 60 ? 'motion' : 'detail'; } catch {}
+  v.onended = () => { if (S.screenStream === stream) stopLive(); };
+}
+
+async function applyQuality() {
+  const v = S.screenStream && S.screenStream.getVideoTracks()[0];
+  if (!v) return;
+  try { await v.applyConstraints(captureConstraints()); } catch {}
+  try { v.contentHint = S.quality.fps >= 60 ? 'motion' : 'detail'; } catch {}
+  for (const en of S.pcs.values()) {
+    if (en.role === 'pub' && en.kind === 'screen') en.pc.getSenders().forEach((s) => tuneSender(s, 'screen'));
+  }
+  S.self.q = qualityLabel();
+  pushState();
+  render();
+  toast(`Qualidade alterada para ${qualityLabel()}`);
+}
+
+function stopLive() {
+  if (!S.screenStream) return;
+  closeAllPub('screen');
+  S.screenStream.getTracks().forEach((t) => { t.onended = null; t.stop(); });
+  S.screenStream = null;
+  S.watched = S.watched.filter((id) => id !== S.me);
+  S.self.live = false;
+  S.self.viewers = 0;
+  S.self.q = '';
+  pushState();
+  render();
+}
+
+// ---------------------------------------------------------------- câmera
+async function toggleCam() {
+  if (S.camStream) {
+    closeAllPub('cam');
+    S.camStream.getTracks().forEach((t) => t.stop());
+    S.camStream = null;
+    S.self.cam = false;
+    pushState();
+    return render();
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return toast('Câmera indisponível neste navegador.');
+  try {
+    // Somente vídeo: o microfone nunca é solicitado
+    S.camStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: CAM.w }, height: { ideal: CAM.h }, frameRate: { ideal: CAM.fps, max: 30 } },
+      audio: false,
+    });
+  } catch {
+    return toast('Não foi possível acessar a câmera.');
+  }
+  const v = S.camStream.getVideoTracks()[0];
+  if (v) {
+    try { v.contentHint = 'motion'; } catch {}
+    v.onended = () => { if (S.camStream) toggleCam(); };
+  }
+  S.self.cam = true;
+  pushState();
+  render();
+}
+
+// -------------------------------------------------------------- assistir
+function info(id) {
+  if (id === S.me) return { id, nick: S.nick, me: true, ...S.self };
+  return S.peers.get(id);
+}
+function isLive(id) { const p = info(id); return !!(p && p.live); }
+function liveIds() { return participants().filter((p) => p.live).map((p) => p.id); }
+function participants() {
+  const list = S.me ? [info(S.me)] : [];
+  return list.concat([...S.peers.values()]);
+}
+
+function watch(id, simultaneous) {
+  if (!isLive(id)) return;
+  if (!simultaneous) {
+    for (const w of S.watched) if (w !== id && w !== S.me) unsubscribe('screen', w);
+    S.watched = [id];
+  } else if (!S.watched.includes(id)) {
+    if (!S.watched.length) {
+      // nada aberto: abre esta e as demais transmissões ao vivo lado a lado
+      S.watched = [id, ...liveIds().filter((x) => x !== id && x !== S.me)];
+    } else {
+      S.watched.push(id);
+    }
+    while (S.watched.length > MAX_WATCH) {
+      const drop = S.watched.shift();
+      if (drop !== S.me) unsubscribe('screen', drop);
+    }
+  }
+  for (const w of S.watched) if (w !== S.me) subscribe('screen', w);
+  render();
+}
+
+function unwatch(id) {
+  S.watched = S.watched.filter((x) => x !== id);
+  if (id !== S.me) unsubscribe('screen', id);
+  render();
+}
+
+// ---------------------------------------------------------------- render
+function render() {
+  if (!S.room) return;
+  S.watched = S.watched.filter(isLive);
+  renderMembers();
+  renderLiveBar();
+  renderStage();
+  renderControls();
+}
+
+function actionButtons(id) {
+  const p = info(id);
+  if (!p || !p.live) return '';
+  const watching = S.watched.includes(id);
+  if (p.me) {
+    return (watching
+      ? `<button class="mini" data-act="unwatch" data-id="${id}">Ocultar prévia</button>`
+      : `<button class="mini" data-act="watch" data-id="${id}">Ver prévia</button>`) +
+      `<button class="mini outline" data-act="stoplive">Parar transmissão</button>`;
+  }
+  if (watching) return `<button class="mini" data-act="unwatch" data-id="${id}">Parar de assistir</button>`;
+  let h = `<button class="mini red" data-act="watch" data-id="${id}">Assistir agora</button>`;
+  if (liveIds().length >= 2) h += `<button class="mini outline" data-act="watchadd" data-id="${id}">Assistir simultaneamente</button>`;
+  return h;
+}
+
+function renderMembers() {
+  const html = participants().map((p) => {
+    const icons = [];
+    if (p.cam) icons.push(icon('cam'));
+    if (p.live) {
+      icons.push(`<span class="m-views" title="Assistindo">${icon('eye')}${p.viewers || 0}</span>`);
+      icons.push('<span class="live-badge">AO VIVO</span>');
+    }
+    const acts = actionButtons(p.id);
+    return `<li class="member${p.me ? ' me' : ''}${p.live ? ' live' : ''}" tabindex="0">
+      <div class="m-row">${avatarHTML(p.nick, 'avatar', p.live)}<span class="m-nick" title="${esc(p.nick)}">${esc(p.nick)}${p.me ? ' (você)' : ''}</span><span class="m-icons">${icons.join('')}</span></div>
+      ${acts ? `<div class="m-actions">${acts}</div>` : ''}
+    </li>`;
+  }).join('');
+  const ul = $('#members');
+  if (ul._html !== html) { ul.innerHTML = html; ul._html = html; }
+
+  const n = participants().length;
+  $('#headInfo').textContent = `${n} ${n === 1 ? 'pessoa' : 'pessoas'} na sala`;
+  const st = $('#meStatus');
+  st.textContent = S.self.live ? `Ao vivo · ${S.self.q} · ${S.self.viewers} assistindo` : 'Online';
+  st.classList.toggle('live', S.self.live);
+}
+
+function renderLiveBar() {
+  const bar = $('#liveBar');
+  const live = liveIds();
+  if (!live.length) { bar.hidden = true; bar.innerHTML = ''; return; }
+  let html = '<span class="lb-title">AO VIVO AGORA</span>';
+  for (const id of live) {
+    const p = info(id);
+    html += `<div class="chip${S.watched.includes(id) ? ' watching' : ''}">${avatarHTML(p.nick, 'avatar', true)}<span class="chip-name">${esc(p.nick)}${p.me ? ' (você)' : ''}</span>${actionButtons(id)}</div>`;
+  }
+  if (S.watched.filter((id) => id !== S.me).length >= 2) {
+    html += '<button class="mini" data-act="unwatch-all">Parar de assistir todas</button>';
+  }
+  if (bar._html !== html) { bar.innerHTML = html; bar._html = html; }
+  bar.hidden = false;
+}
+
+// Tiles são reaproveitados entre renders (vídeos não são recriados)
+const tiles = new Map();
+
+function streamFor(kind, id) {
+  if (id === S.me) return kind === 'screen' ? S.screenStream : S.camStream;
+  const en = S.pcs.get(key('sub', kind, id));
+  return en ? en.stream : null;
+}
+
+function setVideo(video, stream, muted) {
+  if (video.srcObject !== stream) {
+    video.srcObject = stream;
+    video.classList.remove('ok');
+  }
+  video.muted = muted;
+  if (stream && video.paused) {
+    video.play().catch(() => {
+      if (!video.muted) { video.muted = true; video.play().catch(() => {}); }
+    });
+  }
+}
+
+function makeTile(k) {
+  const t = document.createElement('div');
+  t.className = 'tile';
+  const v = document.createElement('video');
+  v.autoplay = true;
+  v.playsInline = true;
+  v.muted = true;
+  v.disablePictureInPicture = false;
+  t.appendChild(v);
+  const rest = document.createElement('div');
+  rest.className = 'tile-ui';
+  rest.style.display = 'contents';
+  t.appendChild(rest);
+  t._video = v;
+  t._ui = rest;
+  t.dataset.key = k;
+  v.addEventListener('playing', () => t.classList.remove('loading'));
+  v.addEventListener('dblclick', () => toggleFullscreen(t));
+  tiles.set(k, t);
+  return t;
+}
+
+function setUI(t, html) {
+  if (t._ui._html !== html) { t._ui.innerHTML = html; t._ui._html = html; }
+}
+
+function updateScreenTile(t, id) {
+  const p = info(id);
+  const stream = streamFor('screen', id);
+  const muted = p.me || S.muted.has(id);
+  t.className = 'tile screen is-live';
+  const hasAudio = !!(stream && stream.getAudioTracks().length);
+  if (!stream || !stream.getVideoTracks().some((tr) => tr.readyState === 'live') || t._video.readyState < 2) t.classList.add('loading');
+  setVideo(t._video, stream, muted);
+  setUI(t, `<div class="t-spinner"></div>
+    <div class="t-top">
+      ${hasAudio && !p.me ? `<button class="t-btn" data-act="mute" data-id="${id}" title="${muted ? 'Ativar som' : 'Silenciar'}">${icon(muted ? 'mute' : 'speaker')}</button>` : ''}
+      <button class="t-btn" data-act="fullscreen" title="Tela cheia">${icon('full')}</button>
+      <button class="t-btn stop" data-act="unwatch" data-id="${id}" title="Parar de assistir">${icon('x')} Parar de assistir</button>
+    </div>
+    <div class="t-label">${icon('screen')}<span>${esc(p.nick)}${p.me ? ' (você)' : ''}</span><span class="live-badge">AO VIVO</span>${p.q ? `<span class="q">${esc(p.q)}</span>` : ''}</div>`);
+}
+
+function updatePersonTile(t, id) {
+  const p = info(id);
+  const stream = p.cam ? streamFor('cam', id) : null;
+  const hasVid = !!(stream && stream.getVideoTracks().length);
+  t.className = `tile cam${hasVid ? ' has-video' : ''}${p.me ? ' mirror' : ''}${p.live ? ' is-live' : ''}`;
+  setVideo(t._video, hasVid ? stream : null, true);
+  const showWatch = p.live && !S.watched.includes(id) && !p.me;
+  setUI(t, `${avatarHTML(p.nick, 'av-big', false)}
+    ${showWatch ? `<div class="t-watch"><span class="live-badge">AO VIVO</span><div class="t-watch-btns">${actionButtons(id)}</div></div>` : ''}
+    <div class="t-label">${p.cam ? icon('cam') : ''}<span>${esc(p.nick)}${p.me ? ' (você)' : ''}</span>${p.live && !showWatch ? '<span class="live-badge">AO VIVO</span>' : ''}</div>`);
+}
+
+function renderStage() {
+  const stage = $('#stage');
+  const strip = $('#strip');
+  const people = participants();
+  const screens = S.watched.filter(isLive);
+  const used = new Set();
+
+  const place = (container, k, update, id) => {
+    const t = tiles.get(k) || makeTile(k);
+    update(t, id);
+    used.add(k);
+    container.appendChild(t); // mantém a ordem; mover no DOM não reinicia o vídeo
+  };
+
+  if (screens.length) {
+    stage.className = `stage screens n${Math.min(screens.length, 4)}`;
+    for (const id of screens) place(stage, `s:${id}`, updateScreenTile, id);
+    for (const p of people) place(strip, `p:${p.id}`, updatePersonTile, p.id);
+    strip.hidden = false;
+  } else {
+    stage.className = 'stage grid';
+    for (const p of people) place(stage, `p:${p.id}`, updatePersonTile, p.id);
+    strip.hidden = true;
+  }
+
+  for (const [k, t] of tiles) {
+    if (used.has(k)) continue;
+    t._video.srcObject = null;
+    t.remove();
+    tiles.delete(k);
+  }
+  fitGrid();
+}
+
+// Escolhe o número de colunas que deixa os quadros 16:9 maiores sem rolagem
+function fitGrid() {
+  const stage = $('#stage');
+  if (!stage.classList.contains('grid')) return;
+  const n = stage.childElementCount;
+  if (!n) return;
+  const GAP = 10;
+  const W = stage.clientWidth - 24;
+  const H = stage.clientHeight - 24;
+  let best = { cols: 1, tw: 0 };
+  for (let cols = 1; cols <= n; cols++) {
+    const rows = Math.ceil(n / cols);
+    const tw = Math.min((W - (cols - 1) * GAP) / cols, ((H - (rows - 1) * GAP) / rows) * 16 / 9);
+    if (tw > best.tw) best = { cols, tw };
+  }
+  const tw = Math.max(140, Math.min(best.tw, n === 1 ? 960 : 4000));
+  stage.style.setProperty('--cols', best.cols);
+  stage.style.setProperty('--tw', `${Math.floor(tw)}px`);
+}
+new ResizeObserver(() => fitGrid()).observe(document.getElementById('stage'));
+
+function renderControls() {
+  const cam = !!S.camStream;
+  const live = !!S.screenStream;
+  const bc = $('#btnCam');
+  bc.classList.toggle('on', cam);
+  bc.title = cam ? 'Desligar câmera' : 'Ligar câmera';
+  bc.innerHTML = icon(cam ? 'cam' : 'camoff');
+  const bs = $('#btnShare');
+  bs.classList.toggle('live', live);
+  bs.title = live ? 'Opções da transmissão' : 'Transmitir tela';
+  bs.innerHTML = icon(live ? 'screenstop' : 'screen');
+  $('#sideCam').classList.toggle('on', cam);
+  $('#sideShare').classList.toggle('on', live);
+  $('#sideShare span').textContent = live ? 'Ao vivo' : 'Tela';
+  $('#btnChat').classList.toggle('on', S.chatOpen);
+}
+
+function toggleFullscreen(tile) {
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  else if (tile && tile.requestFullscreen) tile.requestFullscreen().catch(() => {});
+}
+
+// ------------------------------------------------------------------ chat
+function setChatOpen(open) {
+  S.chatOpen = open;
+  $('#room').classList.toggle('chat-closed', !open);
+  if (open) {
+    S.unread = 0;
+    const m = $('#msgs');
+    m.scrollTop = m.scrollHeight;
+  }
+  const b = $('#unread');
+  b.hidden = !S.unread;
+  b.textContent = S.unread > 9 ? '9+' : S.unread;
+  if (S.room) renderControls();
+}
+
+function linkify(container, text) {
+  const re = /(https?:\/\/[^\s<]+)/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) container.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const a = document.createElement('a');
+    a.href = m[0];
+    a.textContent = m[0];
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    container.appendChild(a);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) container.appendChild(document.createTextNode(text.slice(last)));
+}
+
+function fmtTime(ts) {
+  return new Date(ts).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+}
+
+function appendToMsgs(node) {
+  const box = $('#msgs');
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  box.appendChild(node);
+  while (box.childElementCount > 300) box.firstElementChild.remove();
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function addChat(msg, history) {
+  const grouped = S.lastMsg && S.lastMsg.from === msg.from && msg.ts - S.lastMsg.ts < 5 * 60 * 1000;
+  S.lastMsg = msg;
+  let node;
+  if (grouped) {
+    node = document.createElement('div');
+    node.className = 'msg-line';
+    const tx = document.createElement('div');
+    tx.className = 'msg-text';
+    linkify(tx, msg.text);
+    node.appendChild(tx);
+  } else {
+    node = document.createElement('div');
+    node.className = 'msg';
+    node.innerHTML = `${avatarHTML(msg.nick)}<div class="msg-body"><div class="msg-head"><span class="msg-nick" style="color:${colorFor(msg.nick) === '#3d3d46' ? '#c9c9d1' : colorFor(msg.nick)}">${esc(msg.nick)}</span><span class="msg-time">${fmtTime(msg.ts)}</span></div><div class="msg-text"></div></div>`;
+    linkify(node.querySelector('.msg-text'), msg.text);
+  }
+  appendToMsgs(node);
+  if (!history && !S.chatOpen && msg.from !== S.me) {
+    S.unread++;
+    setChatOpen(false);
+  }
+}
+
+function sysMsg(html, red) {
+  S.lastMsg = null;
+  const d = document.createElement('div');
+  d.className = `sys${red ? ' red' : ''}`;
+  d.innerHTML = `<span>${html}</span>`;
+  appendToMsgs(d);
+}
+
+// ---------------------------------------------------------- modal ao vivo
+function openLiveModal() {
+  if (!canShare) return toast('Seu navegador não permite compartilhar a tela (use Chrome, Edge ou Firefox no PC).');
+  const live = !!S.screenStream;
+  $('#liveTitle').textContent = live ? 'Sua transmissão' : 'Transmitir tela';
+  $('#liveDesc').textContent = live
+    ? `Ao vivo em ${qualityLabel()} para ${S.self.viewers} ${S.self.viewers === 1 ? 'pessoa' : 'pessoas'}. Ajuste a qualidade ou troque o que está sendo compartilhado.`
+    : 'Escolha a qualidade. Em seguida, selecione a tela inteira, uma janela ou uma guia.';
+  $('#audioRow').hidden = live;
+  $('#optAudio').checked = S.quality.audio;
+  syncSeg();
+  $('#modalActions').innerHTML = live
+    ? `<button class="btn ghost" data-act="switch-source">Trocar tela/janela</button>
+       <button class="btn ghost" data-act="apply-quality">Aplicar qualidade</button>
+       <button class="btn primary" data-act="stoplive">Parar transmissão</button>`
+    : `<button class="btn ghost" data-act="close-modal">Cancelar</button>
+       <button class="btn primary" data-act="golive">${icon('screen')} Ir ao vivo</button>`;
+  $('#liveModal').hidden = false;
+}
+
+function syncSeg() {
+  document.querySelectorAll('.seg').forEach((seg) => {
+    const val = seg.dataset.group === 'res' ? S.quality.res : String(S.quality.fps);
+    seg.querySelectorAll('button').forEach((b) => b.classList.toggle('sel', b.dataset.v === val));
+  });
+}
+
+function saveQuality() {
+  try { localStorage.setItem('mrp-quality', JSON.stringify(S.quality)); } catch {}
+}
+
+function closeModals() {
+  document.querySelectorAll('.modal').forEach((m) => { m.hidden = true; });
+}
+
+// ---------------------------------------------------------------- copiar
+async function copyLink() {
+  const link = roomLink();
+  try {
+    await navigator.clipboard.writeText(link);
+  } catch {
+    const i = document.createElement('input');
+    i.value = link;
+    document.body.appendChild(i);
+    i.select();
+    try { document.execCommand('copy'); } catch {}
+    i.remove();
+  }
+  toast('Link de convite copiado!');
+}
+
+// ------------------------------------------------------------------ sair
+function leaveRoom() {
+  S.leaving = true;
+  stopLive();
+  if (S.camStream) { S.camStream.getTracks().forEach((t) => t.stop()); S.camStream = null; }
+  for (const k of [...S.pcs.keys()]) closePc(k);
+  if (S.ws) { try { S.ws.close(); } catch {} }
+  S.ws = null;
+  S.me = null;
+  S.peers.clear();
+  S.watched = [];
+  S.self = { live: false, cam: false, viewers: 0, q: '' };
+  for (const [, t] of tiles) { t._video.srcObject = null; t.remove(); }
+  tiles.clear();
+  S.room = '';
+  closeModals();
+  $('#room').hidden = true;
+  $('#landing').hidden = false;
+  $('#inviteBox').hidden = true;
+  $('#altBtn').hidden = true;
+  $('#mainBtn').textContent = 'Criar sala';
+  history.replaceState(null, '', location.pathname);
+  document.title = 'MRP Live Room';
+  initLandingModeCreate();
+}
+
+function initLandingModeCreate() {
+  // Depois de sair, o formulário volta a criar uma sala nova
+  $('#joinForm').onsubmit = (e) => {
+    e.preventDefault();
+    const nick = $('#nick').value.trim().slice(0, 24);
+    if (!nick) return $('#nick').focus();
+    try { localStorage.setItem('mrp-nick', nick); } catch {}
+    S.nick = nick;
+    S.room = genRoomId();
+    enterRoom(true);
+  };
+}
+
+// ---------------------------------------------------------------- eventos
+document.addEventListener('click', (e) => {
+  const segBtn = e.target.closest('.seg button');
+  if (segBtn) {
+    const g = segBtn.parentElement.dataset.group;
+    if (g === 'res') S.quality.res = segBtn.dataset.v;
+    else S.quality.fps = Number(segBtn.dataset.v);
+    saveQuality();
+    syncSeg();
+    return;
+  }
+  if (e.target.classList.contains('modal')) return closeModals();
+
+  const b = e.target.closest('[data-act]');
+  if (!b) return;
+  const id = b.dataset.id;
+  switch (b.dataset.act) {
+    case 'watch': watch(id, false); break;
+    case 'watchadd': watch(id, true); break;
+    case 'unwatch': unwatch(id); break;
+    case 'unwatch-all':
+      for (const w of [...S.watched]) unwatch(w);
+      break;
+    case 'share':
+      openLiveModal();
+      break;
+    case 'golive':
+      S.quality.audio = $('#optAudio').checked;
+      saveQuality();
+      closeModals();
+      startLive();
+      break;
+    case 'switch-source':
+      closeModals();
+      startLive();
+      break;
+    case 'apply-quality':
+      closeModals();
+      applyQuality();
+      break;
+    case 'stoplive':
+      closeModals();
+      stopLive();
+      break;
+    case 'cam': toggleCam(); break;
+    case 'copy': copyLink(); break;
+    case 'leave': leaveRoom(); break;
+    case 'toggle-chat': setChatOpen(!S.chatOpen); break;
+    case 'toggle-side': $('#room').classList.toggle('side-open'); break;
+    case 'close-modal': closeModals(); break;
+    case 'fullscreen': toggleFullscreen(b.closest('.tile')); break;
+    case 'mute':
+      if (S.muted.has(id)) S.muted.delete(id);
+      else S.muted.add(id);
+      renderStage();
+      break;
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModals();
+});
+
+$('#chatForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const inp = $('#chatInput');
+  const text = inp.value.trim();
+  if (!text) return;
+  send({ t: 'chat', text });
+  inp.value = '';
+});
+
+window.addEventListener('beforeunload', () => {
+  S.leaving = true;
+  if (S.ws) try { S.ws.close(); } catch {}
+});
+
+initLanding();
