@@ -656,7 +656,11 @@ async function startLive() {
       audio: S.quality.audio ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false,
       selfBrowserSurface: 'exclude',
       surfaceSwitching: 'include',
+      // Tela inteira: som do PC. Janela: SÓ o som daquela janela/programa
+      // (Chrome 141+). Sem windowAudio, ao escolher uma janela o Chrome
+      // oferecia o som do sistema inteiro.
       systemAudio: 'include',
+      windowAudio: 'window',
       monitorTypeSurfaces: 'include',
     });
   } catch (err) {
@@ -666,6 +670,7 @@ async function startLive() {
   const old = S.screenStream;
   S.screenStream = stream;
   setupScreenTrack(stream);
+  checkShareAudio(stream);
 
   if (old) {
     // Troca de tela durante a transmissão: substitui as faixas sem derrubar quem assiste
@@ -686,6 +691,20 @@ async function startLive() {
   S.self.q = qualityLabel();
   pushState();
   render();
+}
+
+// Avisa o que aconteceu com o som ao transmitir uma janela
+function checkShareAudio(stream) {
+  const v = stream.getVideoTracks()[0];
+  const a = stream.getAudioTracks()[0];
+  const surface = v && v.getSettings ? v.getSettings().displaySurface : '';
+  S.shareAudioLabel = a ? a.label || 'audio' : '';
+  if (!S.quality.audio || surface !== 'window') return;
+  if (!a) {
+    toast('O som desta janela não foi incluído. Marque "Compartilhar áudio" na janela do navegador; se a opção não aparecer, este navegador ainda não transmite o som de janelas — use uma guia ou a Tela inteira.', 9000);
+  } else if (/system|sistema/i.test(a.label)) {
+    toast('Atenção: o navegador está enviando o som do PC inteiro, não só desta janela.', 7000);
+  }
 }
 
 function setupScreenTrack(stream) {
@@ -938,7 +957,7 @@ setInterval(async () => {
     d: {
       celular: IS_MOBILE,
       nucleos: navigator.hardwareConcurrency,
-      transmitindo: S.self.live ? `${qualityLabel()} · ${v ? v.getSettings().displaySurface : '?'} · captura ${liveHealth.capture}fps` : undefined,
+      transmitindo: S.self.live ? `${qualityLabel()} · ${v ? v.getSettings().displaySurface : '?'} · captura ${liveHealth.capture}fps · som: ${S.shareAudioLabel || 'nenhum'}` : undefined,
       envia,
       recebe,
     },
@@ -999,7 +1018,7 @@ const liveHealth = { capture: null, low: 0, warnedAt: 0, last: null };
 
 setInterval(async () => {
   const v = S.screenStream && S.screenStream.getVideoTracks()[0];
-  if (!v) { liveHealth.capture = null; liveHealth.low = 0; liveHealth.last = null; return; }
+  if (!v) { liveHealth.capture = null; liveHealth.low = 0; liveHealth.slow = 0; liveHealth.slowWarned = false; liveHealth.last = null; return; }
   let fps = null;
   const en = children('screen', S.me)[0];
   if (en) {
@@ -1022,6 +1041,14 @@ setInterval(async () => {
   if (liveHealth.low >= 3 && Date.now() - liveHealth.warnedAt > 60000) {
     liveHealth.warnedAt = Date.now();
     toast('A janela que você está transmitindo parou de ser desenhada (está coberta ou minimizada) e a transmissão congela. Deixe-a visível na tela ou transmita a "Tela inteira".', 9000);
+  }
+  // Testado: janela visível = ~58fps; coberta ou fora de foco, muitos programas
+  // (e jogos com "limite de FPS em segundo plano") passam a desenhar bem menos.
+  const slow = surface === 'window' && fps >= 4 && fps < S.quality.fps * 0.5;
+  liveHealth.slow = slow ? (liveHealth.slow || 0) + 1 : 0;
+  if (liveHealth.slow >= 5 && !liveHealth.slowWarned) {
+    liveHealth.slowWarned = true;
+    toast(`A janela está entregando só ${Math.round(fps)}fps. Se ela estiver atrás de outra janela ou fora de foco, o programa desenha menos (muitos jogos limitam o FPS em segundo plano). Para ficar fluido: deixe a janela visível ou use "Tela inteira".`, 10000);
   }
   renderMembers();
 }, 2000);
