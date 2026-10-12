@@ -376,6 +376,12 @@ img { -webkit-user-drag: none; user-select: none; }
   border: 3px solid rgba(255, 255, 255, .15); border-top-color: var(--red); animation: spin .8s linear infinite; display: none;
 }
 .tile.loading .t-spinner { display: block; }
+.t-msg {
+  position: absolute; top: calc(50% + 34px); left: 50%; transform: translateX(-50%); width: min(90%, 420px);
+  text-align: center; font-size: 13px; color: #e6e6ea; display: none;
+}
+.t-msg small { color: var(--muted); }
+.tile.loading .t-msg { display: block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .tile:fullscreen { border-radius: 0; border: 0; }
 

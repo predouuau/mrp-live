@@ -329,10 +329,11 @@ function screenBitrate(o) {
 }
 
 // O WebRTC começa a ~300 kbps e sobe aos poucos (a imagem ficava ~15s em 540p).
-// Indica ao Chrome uma taxa inicial alta para a transmissão já começar nítida;
-// se a internet não aguentar, ele reduz sozinho em seguida.
+// Começa já em 3 Mbps: em teste deu 720p a 59fps desde o 1º segundo, subindo
+// para 1080p depois. Começar na taxa máxima (7 Mbps por pessoa) estourava o
+// upload de internet real: o 1º quadro chegava quebrado e a tela ficava "carregando".
 function fastStart(sdp, maxBps) {
-  const kbps = Math.round(maxBps / 1000);
+  const kbps = Math.round(Math.min(maxBps, 3_000_000) / 1000);
   const extra = `x-google-start-bitrate=${kbps}`;
   const lines = sdp.split('\r\n');
   const pts = new Set();
@@ -433,7 +434,7 @@ function subscribe(kind, o, via = o) {
   if (S.pcs.has(k)) return;
   const pc = new RTCPeerConnection(S.rtc);
   const sid = rid();
-  const en = { pc, kind, o, peer: via, role: 'sub', sid, stream: null, q: [], waiters: [] };
+  const en = { pc, kind, o, peer: via, role: 'sub', sid, stream: null, q: [], waiters: [], t0: performance.now() };
   S.pcs.set(k, en);
   pc.ontrack = (e) => {
     // Pequeno buffer de reprodução: absorve oscilações da rede em vez de engasgar
@@ -448,7 +449,16 @@ function subscribe(kind, o, via = o) {
     if (e.candidate) relay(via, { k: 'ice', kind, o, sid, from: 'sub', c: e.candidate.toJSON() });
   };
   pc.onconnectionstatechange = () => {
-    if (S.pcs.get(k) === en && pc.connectionState === 'failed') resubscribe(kind, o, 1000);
+    if (S.pcs.get(k) !== en) return;
+    if (pc.connectionState === 'failed') resubscribe(kind, o, 300);
+    // Caiu: se não voltar sozinha em 3s, refaz a conexão (não espera o "failed", que leva ~30s)
+    if (pc.connectionState === 'disconnected') {
+      setTimeout(() => {
+        if (S.pcs.get(k) !== en || pc.connectionState !== 'disconnected' || !wanted(kind, o)) return;
+        if (kind === 'screen') subTries.set(o, (subTries.get(o) || 0) + 1);
+        resubscribe(kind, o, 200);
+      }, 3000);
+    }
   };
   // Sem imagem em 12s: recomeça pela origem (desfaz qualquer corrente travada)
   setTimeout(() => {
@@ -781,6 +791,7 @@ function watch(id, simultaneous) {
 }
 
 function unwatch(id) {
+  subTries.delete(id);
   S.watched = S.watched.filter((x) => x !== id);
   if (id !== S.me) dropSub('screen', id, true);
   render();
@@ -934,6 +945,52 @@ setInterval(async () => {
   });
 }, 5000);
 
+// ------------------------------------------- qualidade constante no longo prazo
+// Quando a internet ou o processador apertam, o navegador reduz a resolução para
+// manter o fps — mas nem sempre volta a subir depois, e a transmissão ia ficando
+// pior com o tempo. A cada 10s: se a resolução está reduzida há 30s e já sobra
+// banda E processador, libera o navegador para voltar à qualidade cheia.
+async function resetAdaptation(sender) {
+  // trocar a preferência passando por "balanced" zera as reduções acumuladas
+  for (const pref of ['balanced', 'maintain-framerate']) {
+    try {
+      const p = sender.getParameters();
+      p.degradationPreference = pref;
+      await sender.setParameters(p);
+    } catch {}
+  }
+}
+
+setInterval(async () => {
+  for (const en of children('screen', S.me)) {
+    const sender = en.pc.getSenders().find((x) => x.track && x.track.kind === 'video');
+    if (!sender) continue;
+    try {
+      const r = await sender.getStats();
+      let out = null;
+      let pair = null;
+      r.forEach((x) => {
+        if (x.type === 'outbound-rtp') out = x;
+        if (x.type === 'transport' && x.selectedCandidatePairId) pair = r.get(x.selectedCandidatePairId);
+      });
+      if (!out || !out.frameHeight) continue;
+      const prev = en.ad || { enc: out.totalEncodeTime || 0, frames: out.framesEncoded || 0, low: 0 };
+      const dFrames = (out.framesEncoded || 0) - prev.frames;
+      const msPerFrame = dFrames > 0 ? (((out.totalEncodeTime || 0) - prev.enc) * 1000) / dFrames : 0;
+      const capH = Math.min(QUALITY[S.quality.res].h, sender.track.getSettings().height || 9999);
+      const reduced = out.frameHeight < capH * 0.8;
+      const bandOk = pair && pair.availableOutgoingBitrate && pair.availableOutgoingBitrate >= screenBitrate(S.me) * 0.9;
+      const cpuOk = msPerFrame > 0 && msPerFrame < (1000 / S.quality.fps) * 0.6;
+      const low = reduced && bandOk && cpuOk ? prev.low + 1 : 0;
+      en.ad = { enc: out.totalEncodeTime || 0, frames: out.framesEncoded || 0, low };
+      if (low >= 3) {
+        en.ad.low = 0;
+        await resetAdaptation(sender);
+      }
+    } catch {}
+  }
+}, 10000);
+
 // ------------------------------------------------ saúde da minha transmissão
 // Mede quantos quadros por segundo a captura está entregando. Testado: ao
 // transmitir uma JANELA que fica coberta ou minimizada, o Windows/o próprio
@@ -1045,7 +1102,9 @@ function updateScreenTile(t, id) {
   const hasAudio = !!(stream && stream.getAudioTracks().length);
   if (!stream || !stream.getVideoTracks().some((tr) => tr.readyState === 'live') || t._video.readyState < 2) t.classList.add('loading');
   setVideo(t._video, stream, muted);
+  const tries = subTries.get(id) || 0;
   setUI(t, `<div class="t-spinner"></div>
+    ${tries >= 2 ? `<div class="t-msg">Reconectando à tela de ${esc(p.nick)} (tentativa ${tries + 1})…<br><small>Se não abrir, a rede de um de vocês pode estar bloqueando a conexão direta.</small></div>` : ''}
     <div class="t-top">
       ${hasAudio && !p.me ? `<button class="t-btn" data-act="mute" data-id="${id}" title="${muted ? 'Ativar som' : 'Silenciar'}">${icon(muted ? 'mute' : 'speaker')}</button>` : ''}
       <button class="t-btn" data-act="fullscreen" title="Tela cheia">${icon('full')}</button>
@@ -1064,16 +1123,40 @@ function showStat(t, id) {
   el.textContent = en && en.stat ? en.stat : (info(id).q || '');
 }
 
+// Tentativas seguidas de abrir a tela de cada pessoa sem conseguir imagem
+const subTries = new Map();
+
+// A cada 2s: atualiza o indicador e vigia quem assiste.
+//  - nenhuma imagem em 8s desde que pediu a tela → refaz a conexão (vem imagem nova)
+//  - conexão caída ("disconnected") por mais de 6s → refaz (reserva; o normal é
+//    o aviso de 3s em subscribe). Não dá para usar "parou de chegar pacote":
+//    com a tela parada, nenhum pacote chega e daria alarme falso.
+// Antes, a tela podia ficar "carregando" para sempre.
 setInterval(async () => {
   for (const en of [...S.pcs.values()]) {
     if (en.role !== 'sub' || en.kind !== 'screen') continue;
+    if (S.pcs.get(subKey('screen', en.o)) !== en) continue;
     try {
       const report = await en.pc.getStats();
-      report.forEach((r) => {
-        if (r.type === 'inbound-rtp' && r.kind === 'video' && r.frameHeight) {
-          en.stat = `${r.frameHeight}p · ${Math.round(r.framesPerSecond || 0)}fps`;
-        }
-      });
+      let inb = null;
+      report.forEach((r) => { if (r.type === 'inbound-rtp' && r.kind === 'video') inb = r; });
+      if (inb && inb.frameHeight) en.stat = `${inb.frameHeight}p · ${Math.round(inb.framesPerSecond || 0)}fps`;
+      const now = performance.now();
+      const decoded = inb ? inb.framesDecoded || 0 : 0;
+      if (decoded > 0 && subTries.has(en.o)) { subTries.delete(en.o); renderStage(); }
+
+      let restart = false;
+      if (decoded === 0 && now - en.t0 > 8000) restart = true;
+      if (en.pc.connectionState === 'disconnected') {
+        if (!en.discSince) en.discSince = now;
+        if (now - en.discSince > 6000) restart = true;
+      } else en.discSince = 0;
+
+      if (restart && wanted('screen', en.o)) {
+        subTries.set(en.o, (subTries.get(en.o) || 0) + 1);
+        resubscribe('screen', en.o, 200);
+        continue;
+      }
       const t = tiles.get(`s:${en.o}`);
       if (t) showStat(t, en.o);
     } catch {}
