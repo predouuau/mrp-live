@@ -208,7 +208,9 @@ server.on('upgrade', (req, socket) => {
   handleConnection(ws);
 });
 
-// Mantém conexões vivas atrás de proxies e derruba as mortas
+// Mantém conexões vivas atrás de proxies e derruba as mortas.
+// Quem some sem avisar (celular sem bateria, internet caiu) sai em no máximo ~20s.
+const HEARTBEAT_MS = 10000;
 setInterval(() => {
   for (const ws of conns) {
     if (!ws.alive) {
@@ -218,17 +220,26 @@ setInterval(() => {
     ws.alive = false;
     ws.ping();
   }
-}, 25000);
+}, HEARTBEAT_MS);
 
 // ---------- Salas ----------
 const rooms = new Map(); // roomId -> { peers: Map<id, peer>, chat: [] }
 
 function publicPeer(p) {
-  return { id: p.id, nick: p.nick, live: p.live, cam: p.cam, viewers: p.viewers, q: p.q };
+  return { id: p.id, nick: p.nick, live: p.live, cam: p.cam, q: p.q, watching: p.watching };
 }
 
 function broadcast(room, msg, exceptId) {
   for (const p of room.peers.values()) if (p.id !== exceptId) p.ws.send(msg);
+}
+
+// Tira alguém da sala e libera tudo o que ele ocupava (idempotente)
+function removePeer(peer, quiet) {
+  const room = rooms.get(peer.room);
+  if (!room || room.peers.get(peer.id) !== peer) return;
+  room.peers.delete(peer.id);
+  broadcast(room, { t: 'peer-leave', id: peer.id, quiet: !!quiet });
+  if (room.peers.size === 0) rooms.delete(peer.room); // sala vazia: apaga sala e chat
 }
 
 function handleConnection(ws) {
@@ -251,24 +262,40 @@ function handleConnection(ws) {
       if (!/^[a-z0-9]{4,32}$/.test(roomId) || !nick) {
         return ws.send({ t: 'error', fatal: true, msg: 'Sala ou nick inválido.' });
       }
+      // Identificador fixo do aparelho/navegador (não usamos IP: quem está no
+      // mesmo Wi-Fi tem o mesmo IP e um derrubaria o outro)
+      const device = /^[a-z0-9]{8,32}$/.test(String(m.device || '')) ? m.device : '';
       room = rooms.get(roomId);
       if (!room) {
         room = { peers: new Map(), chat: [] };
         rooms.set(roomId, room);
       }
+      // O mesmo aparelho entrando de novo substitui a entrada antiga ("fantasma")
+      let rejoin = false;
+      if (device) {
+        for (const old of [...room.peers.values()]) {
+          if (old.device !== device) continue;
+          rejoin = true;
+          old.ws.send({ t: 'error', fatal: true, msg: 'Você entrou nesta sala em outra aba ou aparelho.' });
+          removePeer(old, true);
+          old.ws.close();
+        }
+      }
       if (room.peers.size >= MAX_PEERS_PER_ROOM) {
+        if (room.peers.size === 0) rooms.delete(roomId);
         room = null;
         return ws.send({ t: 'error', fatal: true, msg: 'A sala está cheia.' });
       }
       peer = {
         id: crypto.randomBytes(6).toString('hex'),
         room: roomId,
+        device,
         nick,
         ws,
         live: false,
         cam: false,
-        viewers: 0,
         q: '',
+        watching: [],
       };
       ws.send({
         t: 'joined',
@@ -278,17 +305,26 @@ function handleConnection(ws) {
         chat: room.chat,
       });
       room.peers.set(peer.id, peer);
-      broadcast(room, { t: 'peer-join', peer: publicPeer(peer) }, peer.id);
+      broadcast(room, { t: 'peer-join', peer: publicPeer(peer), rejoin }, peer.id);
       return;
     }
 
     if (!peer) return;
 
     switch (m.t) {
+      case 'leave': {
+        // Saída avisada (botão Sair ou guia fechada): libera na hora
+        removePeer(peer, false);
+        peer = null;
+        ws.close();
+        break;
+      }
       case 'state': {
         if (typeof m.live === 'boolean') peer.live = m.live;
         if (typeof m.cam === 'boolean') peer.cam = m.cam;
-        if (Number.isInteger(m.viewers)) peer.viewers = Math.max(0, Math.min(99, m.viewers));
+        if (Array.isArray(m.watching)) {
+          peer.watching = m.watching.filter((s) => typeof s === 'string').slice(0, 4).map((s) => s.slice(0, 16));
+        }
         if (typeof m.q === 'string') peer.q = m.q.slice(0, 16);
         broadcast(room, { t: 'peer-state', peer: publicPeer(peer) }, peer.id);
         break;
@@ -313,10 +349,7 @@ function handleConnection(ws) {
   });
 
   ws.on('close', () => {
-    if (!peer || !room) return;
-    room.peers.delete(peer.id);
-    broadcast(room, { t: 'peer-leave', id: peer.id });
-    if (room.peers.size === 0) rooms.delete(peer.room);
+    if (peer) removePeer(peer, false);
     peer = null;
   });
 }

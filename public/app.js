@@ -16,7 +16,6 @@ const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 const ICONS = {
-  logo: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 6.5v11l9-5.5z"/></svg>',
   speaker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M16.5 9a4 4 0 0 1 0 6M19 6.5a8 8 0 0 1 0 11"/></svg>',
   mute: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M17 9.5l5 5M22 9.5l-5 5"/></svg>',
   cam: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="13" height="12" rx="2.5"/><path d="M15.5 10.5l6-3.5v10l-6-3.5"/></svg>',
@@ -79,9 +78,11 @@ const S = {
   me: null,
   nick: '',
   room: '',
-  peers: new Map(), // id -> {id, nick, live, cam, viewers, q}
-  self: { live: false, cam: false, viewers: 0, q: '' },
+  peers: new Map(), // id -> {id, nick, live, cam, q, watching}
+  self: { live: false, cam: false, q: '' },
+  sentWatching: '',
   screenStream: null,
+  previewStream: null, // cópia leve da minha tela, só para a prévia local
   camStream: null,
   quality: { res: '720', fps: 60, audio: true },
   watched: [], // ids das telas que estou assistindo (pode incluir a minha)
@@ -95,6 +96,18 @@ const S = {
 };
 
 const canShare = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+
+// Identificador fixo deste aparelho/navegador: se ele entrar de novo na sala,
+// o servidor troca a entrada antiga em vez de ocupar mais uma vaga
+const DEVICE_ID = (() => {
+  let id = '';
+  try { id = localStorage.getItem('mrp-device') || ''; } catch {}
+  if (!/^[a-z0-9]{8,32}$/.test(id)) {
+    id = [...crypto.getRandomValues(new Uint8Array(12))].map((n) => (n % 36).toString(36)).join('');
+    try { localStorage.setItem('mrp-device', id); } catch {}
+  }
+  return id;
+})();
 
 // ---------------------------------------------------------------- entrada
 function initLanding() {
@@ -175,13 +188,17 @@ function send(obj) {
   if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(obj));
 }
 function relay(to, data) { send({ t: 'relay', to, data }); }
-function pushState() { send({ t: 'state', ...S.self }); }
+function pushState() {
+  const watching = S.watched.filter((id) => id !== S.me);
+  S.sentWatching = watching.join(',');
+  send({ t: 'state', ...S.self, watching });
+}
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   S.ws = ws;
-  ws.onopen = () => send({ t: 'join', room: S.room, nick: S.nick });
+  ws.onopen = () => send({ t: 'join', room: S.room, nick: S.nick, device: DEVICE_ID });
   ws.onmessage = (e) => {
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
@@ -199,7 +216,6 @@ function resetConnections() {
   for (const key of [...S.pcs.keys()]) closePc(key);
   S.peers.clear();
   S.watched = S.watched.filter((id) => id === S.me);
-  S.self.viewers = 0;
   render();
 }
 
@@ -213,7 +229,7 @@ async function handle(m) {
       for (const p of m.peers) S.peers.set(p.id, p);
       if (!$('#msgs').childElementCount) for (const msg of m.chat) addChat(msg, true);
       sysMsg(`Você entrou na sala <b>${esc(S.room)}</b>`);
-      if (S.self.live || S.self.cam) pushState();
+      pushState();
       for (const p of S.peers.values()) if (p.cam) subscribe('cam', p.id);
       render();
       break;
@@ -224,7 +240,7 @@ async function handle(m) {
       break;
     case 'peer-join':
       S.peers.set(m.peer.id, m.peer);
-      sysMsg(`<b>${esc(m.peer.nick)}</b> entrou na sala`);
+      if (!m.rejoin) sysMsg(`<b>${esc(m.peer.nick)}</b> entrou na sala`);
       if (m.peer.cam) subscribe('cam', m.peer.id);
       render();
       break;
@@ -234,10 +250,10 @@ async function handle(m) {
       if (!prev) return;
       S.peers.set(p.id, p);
       if (!prev.cam && p.cam) subscribe('cam', p.id);
-      if (prev.cam && !p.cam) closePc(key('sub', 'cam', p.id));
+      if (prev.cam && !p.cam) dropSub('cam', p.id, false);
       if (!prev.live && p.live) sysMsg(`<b>${esc(p.nick)}</b> começou a transmitir`, true);
       if (prev.live && !p.live) {
-        closePc(key('sub', 'screen', p.id));
+        dropSub('screen', p.id, false);
         S.watched = S.watched.filter((id) => id !== p.id);
         sysMsg(`<b>${esc(p.nick)}</b> parou de transmitir`);
       }
@@ -246,11 +262,15 @@ async function handle(m) {
     }
     case 'peer-leave': {
       const p = S.peers.get(m.id);
-      for (const k of [...S.pcs.keys()]) if (S.pcs.get(k).peer === m.id) closePc(k);
       S.peers.delete(m.id);
       S.watched = S.watched.filter((id) => id !== m.id);
-      updateViewers();
-      if (p) sysMsg(`<b>${esc(p.nick)}</b> saiu da sala`);
+      for (const [k, en] of [...S.pcs]) {
+        if (!S.pcs.has(k)) continue;
+        if (en.role === 'sub' && en.o === m.id) dropSub(en.kind, en.o, false); // origem saiu
+        else if (en.role === 'sub' && en.peer === m.id) resubscribe(en.kind, en.o, 300 + Math.random() * 500); // retransmissor saiu
+        else if (en.role === 'pub' && en.peer === m.id) closePc(k);
+      }
+      if (p && !m.quiet) sysMsg(`<b>${esc(p.nick)}</b> saiu da sala`);
       render();
       break;
     }
@@ -264,13 +284,34 @@ async function handle(m) {
 }
 
 // ------------------------------------------------------------------ WebRTC
-const key = (role, kind, peer) => `${role}:${kind}:${peer}`;
+// Árvore de retransmissão: quem transmite envia para poucas pessoas (originCap)
+// e cada espectador repassa para no máximo RELAY_CAP outras. Assim ninguém
+// precisa codificar/enviar uma cópia para a sala inteira.
+//
+// Chaves: sub:<tipo>:<origem>              → o que eu recebo (de quem quer que seja)
+//         pub:<tipo>:<origem>:<espectador> → o que eu envio/repasso
+const RELAY_CAP = 2;
+const subKey = (kind, o) => `sub:${kind}:${o}`;
+const pubKey = (kind, o, viewer) => `pub:${kind}:${o}:${viewer}`;
+const rid = () => Math.random().toString(36).slice(2, 10);
 
 function closePc(k) {
   const en = S.pcs.get(k);
   if (!en) return;
   S.pcs.delete(k);
   try { en.pc.close(); } catch {}
+}
+
+// Quantas pessoas a origem atende direto: mantém o upload em ~16 Mbps no máximo
+function originCap() {
+  const br = QUALITY[S.quality.res].br[S.quality.fps];
+  return Math.max(1, Math.min(3, Math.floor(16_000_000 / br)));
+}
+
+function qualityOf(o) {
+  if (o === S.me) return S.quality;
+  const m = /^(\d+)p (\d+)fps$/.exec((S.peers.get(o) || {}).q || '');
+  return m && QUALITY[m[1]] ? { res: m[1], fps: Number(m[2]) } : { res: '720', fps: 30 };
 }
 
 function preferCodecs(transceiver) {
@@ -291,7 +332,7 @@ function preferCodecs(transceiver) {
   } catch {}
 }
 
-async function tuneSender(sender, kind) {
+async function tuneSender(sender, kind, o) {
   if (!sender.track) return;
   const p = sender.getParameters();
   if (!p.encodings || !p.encodings.length) p.encodings = [{}];
@@ -299,13 +340,13 @@ async function tuneSender(sender, kind) {
   if (sender.track.kind === 'audio') {
     enc.maxBitrate = 128_000;
   } else if (kind === 'screen') {
-    const q = QUALITY[S.quality.res];
-    enc.maxBitrate = q.br[S.quality.fps];
-    enc.maxFramerate = S.quality.fps;
+    const q = qualityOf(o);
+    enc.maxBitrate = QUALITY[q.res].br[q.fps];
+    enc.maxFramerate = q.fps;
     enc.scaleResolutionDownBy = 1;
     enc.priority = 'high';
     enc.networkPriority = 'high';
-    p.degradationPreference = S.quality.fps >= 60 ? 'maintain-framerate' : 'balanced';
+    p.degradationPreference = q.fps >= 60 ? 'maintain-framerate' : 'balanced';
   } else {
     enc.maxBitrate = CAM.br;
     enc.maxFramerate = CAM.fps;
@@ -319,74 +360,118 @@ async function tuneSender(sender, kind) {
   }
 }
 
-// Lado de quem ASSISTE: pede a transmissão e responde à oferta
-function subscribe(kind, pubId) {
-  const k = key('sub', kind, pubId);
+function children(kind, o) {
+  return [...S.pcs.values()].filter((en) => en.role === 'pub' && en.kind === kind && en.o === o);
+}
+
+function wanted(kind, o) {
+  const p = S.peers.get(o);
+  if (!p) return false;
+  return kind === 'screen' ? p.live && S.watched.includes(o) : p.cam;
+}
+
+// Lado de quem ASSISTE: pede a transmissão de `o` (direto ou via um retransmissor)
+function subscribe(kind, o, via = o) {
+  const k = subKey(kind, o);
   if (S.pcs.has(k)) return;
   const pc = new RTCPeerConnection(S.rtc);
-  const sid = Math.random().toString(36).slice(2, 10);
-  const en = { pc, kind, peer: pubId, role: 'sub', sid, stream: null, q: [] };
+  const sid = rid();
+  const en = { pc, kind, o, peer: via, role: 'sub', sid, stream: null, q: [], waiters: [] };
   S.pcs.set(k, en);
   pc.ontrack = (e) => {
     if (!en.stream) en.stream = e.streams[0] || new MediaStream();
     if (!en.stream.getTracks().includes(e.track)) en.stream.addTrack(e.track);
+    // atende quem estava esperando eu receber a imagem (após todas as faixas chegarem)
+    setTimeout(() => en.waiters.splice(0).forEach((fn) => fn()), 0);
     renderStage();
   };
   pc.onicecandidate = (e) => {
-    if (e.candidate) relay(pubId, { k: 'ice', kind, sid, from: 'sub', c: e.candidate.toJSON() });
+    if (e.candidate) relay(via, { k: 'ice', kind, o, sid, from: 'sub', c: e.candidate.toJSON() });
   };
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState !== 'failed' || S.pcs.get(k) !== en) return;
-    closePc(k);
-    setTimeout(() => {
-      const p = S.peers.get(pubId);
-      if (!p) return;
-      if ((kind === 'screen' && p.live && S.watched.includes(pubId)) || (kind === 'cam' && p.cam)) subscribe(kind, pubId);
-      renderStage();
-    }, 1000);
+    if (S.pcs.get(k) === en && pc.connectionState === 'failed') resubscribe(kind, o, 1000);
   };
-  relay(pubId, { k: 'sub', kind, sid });
+  // Sem imagem em 12s: recomeça pela origem (desfaz qualquer corrente travada)
+  setTimeout(() => {
+    if (S.pcs.get(k) === en && !en.stream) resubscribe(kind, o, Math.random() * 1000);
+  }, 12000);
+  relay(via, { k: 'sub', kind, o, sid });
 }
 
-function unsubscribe(kind, pubId) {
-  const k = key('sub', kind, pubId);
+// Para de receber `o` e avisa quem recebia de mim, para que reconectem pela origem
+function dropSub(kind, o, sendUnsub) {
+  const k = subKey(kind, o);
   const en = S.pcs.get(k);
-  if (!en) return;
-  closePc(k);
-  relay(pubId, { k: 'unsub', kind, sid: en.sid });
+  if (en) {
+    closePc(k);
+    if (sendUnsub) relay(en.peer, { k: 'unsub', kind, o, sid: en.sid });
+  }
+  for (const c of children(kind, o)) {
+    relay(c.peer, { k: 'nostream', kind, o, sid: c.sid });
+    closePc(pubKey(kind, o, c.peer));
+  }
 }
 
-// Lado de quem TRANSMITE: cria a conexão só para quem pediu
-async function publish(kind, viewerId, sid) {
-  const stream = kind === 'screen' ? S.screenStream : S.camStream;
-  if (!stream) return relay(viewerId, { k: 'nostream', kind, sid });
-  const k = key('pub', kind, viewerId);
-  closePc(k);
+function resubscribe(kind, o, delay) {
+  dropSub(kind, o, true);
+  setTimeout(() => {
+    if (wanted(kind, o)) subscribe(kind, o);
+    renderStage();
+  }, delay);
+}
+
+// Lado de quem TRANSMITE ou RETRANSMITE: atende, ou indica outro espectador se estiver cheio
+async function onSubRequest(kind, o, viewer, sid) {
+  let stream = null;
+  if (o === S.me) {
+    stream = kind === 'screen' ? S.screenStream : S.camStream;
+  } else if (kind === 'screen') {
+    const up = S.pcs.get(subKey(kind, o));
+    if (up && !up.stream) {
+      up.waiters.push(() => onSubRequest(kind, o, viewer, sid));
+      return;
+    }
+    stream = up ? up.stream : null;
+  }
+  if (!stream || !stream.getVideoTracks().some((t) => t.readyState === 'live')) {
+    return relay(viewer, { k: 'nostream', kind, o, sid });
+  }
+
+  closePc(pubKey(kind, o, viewer));
+  const kids = children(kind, o);
+  const cap = kind === 'cam' ? Infinity : o === S.me ? originCap() : RELAY_CAP;
+  if (kids.length >= cap) {
+    const target = kids.sort((a, b) => a.redirects - b.redirects)[0];
+    target.redirects++;
+    return relay(viewer, { k: 'redirect', kind, o, sid, via: target.peer });
+  }
+  await publish(kind, o, viewer, sid, stream);
+}
+
+async function publish(kind, o, viewer, sid, stream) {
+  const k = pubKey(kind, o, viewer);
   const pc = new RTCPeerConnection(S.rtc);
-  const en = { pc, kind, peer: viewerId, role: 'pub', sid, q: [] };
+  const en = { pc, kind, o, peer: viewer, role: 'pub', sid, q: [], redirects: 0 };
   S.pcs.set(k, en);
 
   for (const track of stream.getTracks()) {
+    if (track.readyState !== 'live') continue;
     const tr = pc.addTransceiver(track, { direction: 'sendonly', streams: [stream] });
     if (track.kind === 'video') preferCodecs(tr);
   }
   pc.onicecandidate = (e) => {
-    if (e.candidate) relay(viewerId, { k: 'ice', kind, sid, from: 'pub', c: e.candidate.toJSON() });
+    if (e.candidate) relay(viewer, { k: 'ice', kind, o, sid, from: 'pub', c: e.candidate.toJSON() });
   };
   pc.onconnectionstatechange = () => {
     if (S.pcs.get(k) !== en) return;
-    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-      closePc(k);
-      updateViewers();
-    }
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') closePc(k);
   };
-  updateViewers();
 
   const offer = await pc.createOffer();
   if (S.pcs.get(k) !== en) return;
   await pc.setLocalDescription(offer);
-  for (const s of pc.getSenders()) tuneSender(s, kind);
-  relay(viewerId, { k: 'offer', kind, sid, sdp: pc.localDescription.toJSON() });
+  for (const s of pc.getSenders()) tuneSender(s, kind, o);
+  relay(viewer, { k: 'offer', kind, o, sid, sdp: pc.localDescription.toJSON() });
 }
 
 async function flushIce(en) {
@@ -396,48 +481,64 @@ async function flushIce(en) {
 }
 
 async function onSignal(from, d) {
-  if (!d || !d.kind || (d.kind !== 'screen' && d.kind !== 'cam')) return;
+  if (!d || (d.kind !== 'screen' && d.kind !== 'cam') || typeof d.o !== 'string') return;
+  const { kind, o, sid } = d;
+  // conexão de recebimento válida: mesma sessão e vinda de quem me atende
+  const mySub = () => {
+    const en = S.pcs.get(subKey(kind, o));
+    return en && en.sid === sid && en.peer === from ? en : null;
+  };
+  const myPub = () => {
+    const en = S.pcs.get(pubKey(kind, o, from));
+    return en && en.sid === sid ? en : null;
+  };
   switch (d.k) {
     case 'sub':
-      await publish(d.kind, from, d.sid);
+      await onSubRequest(kind, o, from, sid);
       break;
-    case 'unsub': {
-      const en = S.pcs.get(key('pub', d.kind, from));
-      if (en && en.sid === d.sid) {
-        closePc(key('pub', d.kind, from));
-        updateViewers();
-      }
+    case 'unsub':
+      if (myPub()) closePc(pubKey(kind, o, from));
+      break;
+    case 'redirect': {
+      if (!mySub()) return;
+      dropSub(kind, o, false);
+      const loop = d.via === S.me || d.via === o || !S.peers.has(d.via);
+      if (loop) resubscribe(kind, o, 800);
+      else subscribe(kind, o, d.via);
       break;
     }
     case 'nostream': {
-      const en = S.pcs.get(key('sub', d.kind, from));
-      if (en && en.sid === d.sid) {
-        closePc(key('sub', d.kind, from));
-        if (d.kind === 'screen') S.watched = S.watched.filter((id) => id !== from);
+      if (!mySub()) return;
+      dropSub(kind, o, false);
+      if (from === o) {
+        if (kind === 'screen') S.watched = S.watched.filter((id) => id !== o);
         render();
+      } else {
+        // o retransmissor perdeu a imagem: volto a pedir pela origem
+        resubscribe(kind, o, 300 + Math.random() * 500);
       }
       break;
     }
     case 'offer': {
-      const en = S.pcs.get(key('sub', d.kind, from));
-      if (!en || en.sid !== d.sid) return;
+      const en = mySub();
+      if (!en) return;
       await en.pc.setRemoteDescription(d.sdp);
       await flushIce(en);
       const answer = await en.pc.createAnswer();
       await en.pc.setLocalDescription(answer);
-      relay(from, { k: 'answer', kind: d.kind, sid: d.sid, sdp: en.pc.localDescription.toJSON() });
+      relay(from, { k: 'answer', kind, o, sid, sdp: en.pc.localDescription.toJSON() });
       break;
     }
     case 'answer': {
-      const en = S.pcs.get(key('pub', d.kind, from));
-      if (!en || en.sid !== d.sid) return;
+      const en = myPub();
+      if (!en) return;
       await en.pc.setRemoteDescription(d.sdp);
       await flushIce(en);
       break;
     }
     case 'ice': {
-      const en = S.pcs.get(key(d.from === 'pub' ? 'sub' : 'pub', d.kind, from));
-      if (!en || en.sid !== d.sid) return;
+      const en = d.from === 'pub' ? mySub() : myPub();
+      if (!en) return;
       if (en.pc.remoteDescription) {
         try { await en.pc.addIceCandidate(d.c); } catch {}
       } else en.q.push(d.c);
@@ -446,18 +547,16 @@ async function onSignal(from, d) {
   }
 }
 
-function updateViewers() {
+// Quem está assistindo cada pessoa (cada um informa o que assiste no próprio estado)
+function viewersOf(id) {
   let n = 0;
-  for (const en of S.pcs.values()) if (en.role === 'pub' && en.kind === 'screen') n++;
-  if (n !== S.self.viewers) {
-    S.self.viewers = n;
-    pushState();
-    renderMembers();
-  }
+  for (const p of S.peers.values()) if (p.id !== id && (p.watching || []).includes(id)) n++;
+  if (id !== S.me && S.watched.includes(id)) n++;
+  return n;
 }
 
-function closeAllPub(kind) {
-  for (const [k, en] of [...S.pcs]) if (en.role === 'pub' && en.kind === kind) closePc(k);
+function closeOwnPub(kind) {
+  for (const [k, en] of [...S.pcs]) if (en.role === 'pub' && en.kind === kind && en.o === S.me) closePc(k);
 }
 
 // -------------------------------------------------------- tela (Go Live)
@@ -495,17 +594,18 @@ async function startLive() {
   if (old) {
     // Troca de tela durante a transmissão: substitui as faixas sem derrubar quem assiste
     for (const en of S.pcs.values()) {
-      if (en.role !== 'pub' || en.kind !== 'screen') continue;
+      if (en.role !== 'pub' || en.kind !== 'screen' || en.o !== S.me) continue;
       for (const sender of en.pc.getSenders()) {
         if (!sender.track) continue;
         const nt = stream.getTracks().find((t) => t.kind === sender.track.kind);
-        if (nt) sender.replaceTrack(nt).then(() => tuneSender(sender, 'screen')).catch(() => {});
+        if (nt) sender.replaceTrack(nt).then(() => tuneSender(sender, 'screen', S.me)).catch(() => {});
       }
     }
     old.getTracks().forEach((t) => { t.onended = null; t.stop(); });
-  } else {
-    if (!S.watched.length) S.watched = [S.me];
+    dropPreview();
   }
+  // A prévia da própria tela NÃO abre sozinha: com a tela inteira ela vira um
+  // "espelho infinito" que sobrecarrega a GPU e trava o Alt+Tab do Windows.
   S.self.live = true;
   S.self.q = qualityLabel();
   pushState();
@@ -526,7 +626,7 @@ async function applyQuality() {
   try { await v.applyConstraints(captureConstraints()); } catch {}
   try { v.contentHint = S.quality.fps >= 60 ? 'motion' : 'detail'; } catch {}
   for (const en of S.pcs.values()) {
-    if (en.role === 'pub' && en.kind === 'screen') en.pc.getSenders().forEach((s) => tuneSender(s, 'screen'));
+    if (en.role === 'pub' && en.kind === 'screen' && en.o === S.me) en.pc.getSenders().forEach((s) => tuneSender(s, 'screen', S.me));
   }
   S.self.q = qualityLabel();
   pushState();
@@ -536,12 +636,12 @@ async function applyQuality() {
 
 function stopLive() {
   if (!S.screenStream) return;
-  closeAllPub('screen');
+  closeOwnPub('screen');
   S.screenStream.getTracks().forEach((t) => { t.onended = null; t.stop(); });
   S.screenStream = null;
+  dropPreview();
   S.watched = S.watched.filter((id) => id !== S.me);
   S.self.live = false;
-  S.self.viewers = 0;
   S.self.q = '';
   pushState();
   render();
@@ -550,7 +650,7 @@ function stopLive() {
 // ---------------------------------------------------------------- câmera
 async function toggleCam() {
   if (S.camStream) {
-    closeAllPub('cam');
+    closeOwnPub('cam');
     S.camStream.getTracks().forEach((t) => t.stop());
     S.camStream = null;
     S.self.cam = false;
@@ -591,8 +691,13 @@ function participants() {
 
 function watch(id, simultaneous) {
   if (!isLive(id)) return;
+  if (id === S.me) {
+    const v = S.screenStream && S.screenStream.getVideoTracks()[0];
+    const surface = v && v.getSettings ? v.getSettings().displaySurface : '';
+    if (surface === 'monitor') toast('Você está transmitindo a tela inteira: a prévia aparece dentro da própria transmissão (efeito espelho).', 5000);
+  }
   if (!simultaneous) {
-    for (const w of S.watched) if (w !== id && w !== S.me) unsubscribe('screen', w);
+    for (const w of S.watched) if (w !== id && w !== S.me) dropSub('screen', w, true);
     S.watched = [id];
   } else if (!S.watched.includes(id)) {
     if (!S.watched.length) {
@@ -603,7 +708,7 @@ function watch(id, simultaneous) {
     }
     while (S.watched.length > MAX_WATCH) {
       const drop = S.watched.shift();
-      if (drop !== S.me) unsubscribe('screen', drop);
+      if (drop !== S.me) dropSub('screen', drop, true);
     }
   }
   for (const w of S.watched) if (w !== S.me) subscribe('screen', w);
@@ -612,7 +717,7 @@ function watch(id, simultaneous) {
 
 function unwatch(id) {
   S.watched = S.watched.filter((x) => x !== id);
-  if (id !== S.me) unsubscribe('screen', id);
+  if (id !== S.me) dropSub('screen', id, true);
   render();
 }
 
@@ -620,6 +725,7 @@ function unwatch(id) {
 function render() {
   if (!S.room) return;
   S.watched = S.watched.filter(isLive);
+  if (S.ws && S.watched.filter((id) => id !== S.me).join(',') !== S.sentWatching) pushState();
   renderMembers();
   renderLiveBar();
   renderStage();
@@ -647,7 +753,7 @@ function renderMembers() {
     const icons = [];
     if (p.cam) icons.push(icon('cam'));
     if (p.live) {
-      icons.push(`<span class="m-views" title="Assistindo">${icon('eye')}${p.viewers || 0}</span>`);
+      icons.push(`<span class="m-views" title="Assistindo">${icon('eye')}${viewersOf(p.id)}</span>`);
       icons.push('<span class="live-badge">AO VIVO</span>');
     }
     const acts = actionButtons(p.id);
@@ -662,7 +768,7 @@ function renderMembers() {
   const n = participants().length;
   $('#headInfo').textContent = `${n} ${n === 1 ? 'pessoa' : 'pessoas'} na sala`;
   const st = $('#meStatus');
-  st.textContent = S.self.live ? `Ao vivo · ${S.self.q} · ${S.self.viewers} assistindo` : 'Online';
+  st.textContent = S.self.live ? `Ao vivo · ${S.self.q} · ${viewersOf(S.me)} assistindo` : 'Online';
   st.classList.toggle('live', S.self.live);
 }
 
@@ -685,9 +791,29 @@ function renderLiveBar() {
 // Tiles são reaproveitados entre renders (vídeos não são recriados)
 const tiles = new Map();
 
+// Prévia local leve: cópia da faixa reduzida para 540p/10fps. A transmissão
+// enviada aos amigos continua na qualidade escolhida.
+function selfPreview() {
+  if (!S.screenStream) return null;
+  if (!S.previewStream) {
+    const v = S.screenStream.getVideoTracks()[0];
+    if (!v) return null;
+    const c = v.clone();
+    c.applyConstraints({ width: { max: 960 }, height: { max: 540 }, frameRate: { max: 10 } }).catch(() => {});
+    S.previewStream = new MediaStream([c]);
+  }
+  return S.previewStream;
+}
+
+function dropPreview() {
+  if (!S.previewStream) return;
+  S.previewStream.getTracks().forEach((t) => t.stop());
+  S.previewStream = null;
+}
+
 function streamFor(kind, id) {
-  if (id === S.me) return kind === 'screen' ? S.screenStream : S.camStream;
-  const en = S.pcs.get(key('sub', kind, id));
+  if (id === S.me) return kind === 'screen' ? selfPreview() : S.camStream;
+  const en = S.pcs.get(subKey(kind, id));
   return en ? en.stream : null;
 }
 
@@ -744,7 +870,7 @@ function updateScreenTile(t, id) {
       <button class="t-btn" data-act="fullscreen" title="Tela cheia">${icon('full')}</button>
       <button class="t-btn stop" data-act="unwatch" data-id="${id}" title="Parar de assistir">${icon('x')} Parar de assistir</button>
     </div>
-    <div class="t-label">${icon('screen')}<span>${esc(p.nick)}${p.me ? ' (você)' : ''}</span><span class="live-badge">AO VIVO</span>${p.q ? `<span class="q">${esc(p.q)}</span>` : ''}</div>`);
+    <div class="t-label">${icon('screen')}<span>${esc(p.nick)}${p.me ? ' (você)' : ''}</span><span class="live-badge">AO VIVO</span>${p.me ? '<span class="q">prévia leve · 10fps</span>' : p.q ? `<span class="q">${esc(p.q)}</span>` : ''}</div>`);
 }
 
 function updatePersonTile(t, id) {
@@ -764,32 +890,47 @@ function renderStage() {
   const strip = $('#strip');
   const people = participants();
   const screens = S.watched.filter(isLive);
-  const used = new Set();
 
-  const place = (container, k, update, id) => {
-    const t = tiles.get(k) || makeTile(k);
-    update(t, id);
-    used.add(k);
-    container.appendChild(t); // mantém a ordem; mover no DOM não reinicia o vídeo
-  };
-
+  // Plano: [container, chave, atualizar, id]
+  const plan = [];
   if (screens.length) {
-    stage.className = `stage screens n${Math.min(screens.length, 4)}`;
-    for (const id of screens) place(stage, `s:${id}`, updateScreenTile, id);
-    for (const p of people) place(strip, `p:${p.id}`, updatePersonTile, p.id);
-    strip.hidden = false;
+    for (const id of screens) plan.push([stage, `s:${id}`, updateScreenTile, id]);
+    for (const p of people) plan.push([strip, `p:${p.id}`, updatePersonTile, p.id]);
   } else {
-    stage.className = 'stage grid';
-    for (const p of people) place(stage, `p:${p.id}`, updatePersonTile, p.id);
-    strip.hidden = true;
+    for (const p of people) plan.push([stage, `p:${p.id}`, updatePersonTile, p.id]);
   }
+  const used = new Set(plan.map((x) => x[1]));
 
+  // Remove primeiro o que saiu, para não precisar mover os que ficam
   for (const [k, t] of tiles) {
     if (used.has(k)) continue;
     t._video.srcObject = null;
     t.remove();
     tiles.delete(k);
   }
+
+  // Só mexe no DOM quando a posição muda de verdade. Tirar um elemento do lugar
+  // faz o navegador sair da tela cheia, então o quadro em tela cheia nunca é movido.
+  const fs = document.fullscreenElement || document.webkitFullscreenElement;
+  const pos = new Map();
+  for (const [container, k, update, id] of plan) {
+    const t = tiles.get(k) || makeTile(k);
+    update(t, id);
+    const i = pos.get(container) || 0;
+    const at = container.children[i];
+    if (at !== t) {
+      if (t === fs) {
+        if (t.parentNode !== container) container.appendChild(t);
+      } else {
+        container.insertBefore(t, at || null);
+      }
+    }
+    pos.set(container, [...container.children].indexOf(t) + 1);
+  }
+
+  stage.className = screens.length ? `stage screens n${Math.min(screens.length, 4)}` : 'stage grid';
+  strip.hidden = !screens.length;
+  if (!screens.includes(S.me)) dropPreview();
   fitGrid();
 }
 
@@ -832,8 +973,19 @@ function renderControls() {
 }
 
 function toggleFullscreen(tile) {
-  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-  else if (tile && tile.requestFullscreen) tile.requestFullscreen().catch(() => {});
+  const cur = document.fullscreenElement || document.webkitFullscreenElement;
+  if (cur) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    return;
+  }
+  if (!tile) return;
+  const req = tile.requestFullscreen || tile.webkitRequestFullscreen;
+  if (req) {
+    const r = req.call(tile);
+    if (r && r.catch) r.catch(() => {});
+  } else if (tile._video && tile._video.webkitEnterFullscreen) {
+    tile._video.webkitEnterFullscreen(); // iPhone: só o vídeo pode ir para tela cheia
+  }
 }
 
 // ------------------------------------------------------------------ chat
@@ -918,7 +1070,7 @@ function openLiveModal() {
   const live = !!S.screenStream;
   $('#liveTitle').textContent = live ? 'Sua transmissão' : 'Transmitir tela';
   $('#liveDesc').textContent = live
-    ? `Ao vivo em ${qualityLabel()} para ${S.self.viewers} ${S.self.viewers === 1 ? 'pessoa' : 'pessoas'}. Ajuste a qualidade ou troque o que está sendo compartilhado.`
+    ? `Ao vivo em ${qualityLabel()} para ${viewersOf(S.me)} ${viewersOf(S.me) === 1 ? 'pessoa' : 'pessoas'}. Ajuste a qualidade ou troque o que está sendo compartilhado.`
     : 'Escolha a qualidade. Em seguida, selecione a tela inteira, uma janela ou uma guia.';
   $('#audioRow').hidden = live;
   $('#optAudio').checked = S.quality.audio;
@@ -969,12 +1121,14 @@ function leaveRoom() {
   stopLive();
   if (S.camStream) { S.camStream.getTracks().forEach((t) => t.stop()); S.camStream = null; }
   for (const k of [...S.pcs.keys()]) closePc(k);
+  send({ t: 'leave' }); // avisa o servidor para liberar a vaga na hora
   if (S.ws) { try { S.ws.close(); } catch {} }
   S.ws = null;
   S.me = null;
   S.peers.clear();
   S.watched = [];
-  S.self = { live: false, cam: false, viewers: 0, q: '' };
+  S.self = { live: false, cam: false, q: '' };
+  S.sentWatching = '';
   for (const [, t] of tiles) { t._video.srcObject = null; t.remove(); }
   tiles.clear();
   S.room = '';
@@ -1074,9 +1228,24 @@ $('#chatForm').addEventListener('submit', (e) => {
   inp.value = '';
 });
 
-window.addEventListener('beforeunload', () => {
+// Fechou a guia/navegador (ou trocou de página): sai da sala na hora.
+// "pagehide" também dispara no celular, onde "beforeunload" muitas vezes não dispara.
+function leaveOnClose() {
+  if (!S.ws) return;
   S.leaving = true;
-  if (S.ws) try { S.ws.close(); } catch {}
+  send({ t: 'leave' });
+  try { S.ws.close(); } catch {}
+  for (const k of [...S.pcs.keys()]) closePc(k);
+}
+window.addEventListener('pagehide', leaveOnClose);
+window.addEventListener('beforeunload', leaveOnClose);
+
+// Voltou para a guia pelo botão "voltar" do navegador: entra de novo na sala
+window.addEventListener('pageshow', (e) => {
+  if (!e.persisted || !S.room) return;
+  resetConnections();
+  S.leaving = false;
+  connect();
 });
 
 initLanding();

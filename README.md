@@ -36,7 +36,7 @@ TURN_URL=turn:seu-servidor:3478   TURN_USER=usuario   TURN_PASS=senha
 - **Ao parar de assistir, a conexão é fechada**, e o decodificador libera a CPU e a GPU.
 - **Câmera leve:** 640×360, 24 fps, 500 kbps, sem microfone.
 
-Limite prático: como a conexão é P2P, quem transmite envia uma cópia para cada pessoa que assiste. Para até ~4 espectadores em 1080p60 isso funciona bem numa conexão de upload comum. Para mais gente, reduza para 720p.
+- **Árvore de retransmissão:** quem transmite envia no máximo 2 ou 3 cópias (2 em 1080p60, 3 nas demais qualidades). Cada espectador repassa para no máximo 2 outros. Com 6 pessoas, por exemplo, quem transmite envia só 2 cópias em vez de 5. Se alguém do meio da corrente sair, quem estava abaixo reconecta sozinho em poucos segundos.
 
 | Qualidade | 30 fps    | 60 fps   |
 |-----------|-----------|----------|
