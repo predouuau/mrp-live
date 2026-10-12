@@ -3,27 +3,52 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0b0b0d">
+  <meta name="theme-color" content="#050506">
   <title>MRP Live Room</title>
   <link rel="icon" href="assets/logo.png" type="image/png">
+  <!-- Ícones: Font Awesome Free — https://fontawesome.com/search?ic=free-collection -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
 <!-- ============ ENTRADA ============ -->
 <section id="landing" class="landing">
-  <form id="joinForm" class="card" autocomplete="off">
-    <img class="landing-logo" src="assets/logo.png" alt="MRP Live Room">
-    <p class="sub">Compartilhe sua tela com seus amigos em tempo real.</p>
-    <div id="inviteBox" class="invite-box" hidden>
-      Você foi convidado para a sala <b id="inviteRoom"></b>
+  <header class="land-top">
+    <img class="land-top-logo" src="assets/logo.png" alt="MRP">
+    <span class="land-top-line"></span>
+    <span class="land-top-text">LIVE ROOM</span>
+  </header>
+  <div class="land-vert-left" aria-hidden="true"><span>つながる、つくる、もっと</span><i></i></div>
+  <div class="land-vert-right" aria-hidden="true">MRP<b></b>LIVE<b></b>SHARE<b></b>CREATE</div>
+
+  <div class="card-glow">
+    <div class="card-frame">
+      <form id="joinForm" class="card" autocomplete="off">
+        <img class="landing-logo" src="assets/logo.png" alt="MRP">
+        <div class="land-kicker">LIVE ROOM</div>
+        <h1 class="land-title">
+          <span id="landTitle">Crie uma sala</span>
+          <span id="landRoom" class="land-room" hidden></span>
+        </h1>
+        <label for="nick" class="nick-label"><i class="fa-regular fa-user"></i><span>SEU NICK</span></label>
+        <div class="nick-field">
+          <input id="nick" maxlength="24" placeholder="Digite seu nick aqui.." required>
+          <i class="fa-solid fa-code"></i>
+        </div>
+        <button id="mainBtn" class="btn primary big" type="submit"><i class="fa-solid fa-right-to-bracket"></i><span>Criar sala</span></button>
+        <div id="altBox" class="alt-box" hidden>
+          <div class="or"><span>OU</span></div>
+          <button id="altBtn" class="btn pill" type="button"><i class="fa-solid fa-link"></i><span>Criar nova sala</span></button>
+          <a class="back-link" href="./"><i class="fa-solid fa-arrow-left"></i><span>Voltar para o site</span></a>
+        </div>
+        <p id="secureWarn" class="warn" hidden></p>
+      </form>
     </div>
-    <label for="nick">SEU NICK</label>
-    <input id="nick" maxlength="24" placeholder="Digite o nick desejado" required>
-    <button id="mainBtn" class="btn primary big" type="submit">Criar sala</button>
-    <button id="altBtn" class="link-btn" type="button" hidden>ou criar uma nova sala</button>
-    <p id="secureWarn" class="warn" hidden></p>
-  </form>
+  </div>
 </section>
 
 <!-- ============ SALA ============ -->
@@ -31,32 +56,34 @@
   <aside id="sidebar" class="sidebar">
     <header class="side-head">
       <img class="side-logo" src="assets/logo.png" alt="MRP">
-      <span>Live Room</span>
+      <span class="v-sep"></span>
+      <span class="side-title">Live Room</span>
+      <span class="dot"></span>
     </header>
 
     <div class="side-scroll">
       <div class="cat">SALA DE TRANSMISSÃO</div>
       <div class="channel">
-        <i data-icon="speaker"></i>
+        <i class="fa-solid fa-display"></i>
         <span id="chanName">sala</span>
+        <span class="dot"></span>
       </div>
       <ul id="members" class="members"></ul>
       <button class="invite-row" data-act="copy">
-        <i data-icon="userplus"></i> Convidar amigos <i data-icon="chev" class="chev"></i>
+        <i class="fa-solid fa-user-plus"></i><span>Convidar amigos</span><i class="fa-solid fa-chevron-right chev"></i>
       </button>
     </div>
 
     <div class="voice-status">
       <div class="vs-text">
-        <div class="vs-title"><i data-icon="signal"></i> Conectado à sala</div>
+        <div class="vs-title"><i class="fa-solid fa-signal"></i> Conectado à sala</div>
         <div class="vs-sub" id="vsSub"></div>
       </div>
-      <button class="icon-btn" data-act="copy" title="Copiar link de convite"><i data-icon="link"></i></button>
-      <button class="icon-btn danger" data-act="leave" title="Sair da sala"><i data-icon="leave"></i></button>
+      <button class="icon-btn" data-act="copy" title="Copiar link de convite"><i class="fa-solid fa-link"></i></button>
     </div>
     <div class="side-actions">
-      <button class="side-btn" id="sideCam" data-act="cam"><i data-icon="cam"></i><span>Câmera</span></button>
-      <button class="side-btn" id="sideShare" data-act="share"><i data-icon="screen"></i><span>Tela</span></button>
+      <button class="side-btn" id="sideCam" data-act="cam"><i class="fa-solid fa-video"></i><span>Câmera</span></button>
+      <button class="side-btn" id="sideShare" data-act="share"><i class="fa-solid fa-display"></i><span>Tela</span></button>
     </div>
     <div class="user-panel">
       <div id="meAvatar" class="avatar"></div>
@@ -64,6 +91,7 @@
         <div id="meNick" class="up-nick"></div>
         <div id="meStatus" class="up-status">Online</div>
       </div>
+      <span id="meLive" class="up-live" hidden><i class="fa-solid fa-tower-broadcast"></i>AO VIVO</span>
     </div>
   </aside>
 
@@ -71,37 +99,45 @@
 
   <main class="main">
     <header class="main-head">
-      <button class="icon-btn mobile-only" data-act="toggle-side" title="Participantes"><i data-icon="menu"></i></button>
-      <i data-icon="speaker" class="head-ic"></i>
+      <button class="icon-btn mobile-only" data-act="toggle-side" title="Participantes"><i class="fa-solid fa-bars"></i></button>
+      <i class="fa-solid fa-volume-high head-ic"></i>
       <b id="headName"></b>
+      <span class="v-sep"></span>
       <span id="headInfo" class="head-info"></span>
       <div class="head-right">
-        <button class="icon-btn" data-act="copy" title="Copiar link de convite"><i data-icon="link"></i></button>
-        <button class="icon-btn" data-act="toggle-chat" title="Chat"><i data-icon="chat"></i><span id="unread" class="badge" hidden></span></button>
+        <button class="icon-btn" id="headMembers" data-act="toggle-members" title="Mostrar membros abaixo da tela"><i class="fa-solid fa-user-group"></i></button>
+        <button class="icon-btn" data-act="copy" title="Copiar link de convite"><i class="fa-solid fa-link"></i></button>
+        <button class="icon-btn" data-act="toggle-chat" title="Chat"><i class="fa-regular fa-message"></i><span id="unread" class="badge" hidden></span></button>
       </div>
     </header>
 
-    <div id="liveBar" class="live-bar" hidden></div>
-    <section id="stage" class="stage"></section>
+    <div class="stage-wrap">
+      <div class="stage-glow">
+        <div class="stage-frame">
+          <section id="stage" class="stage"></section>
+        </div>
+      </div>
+    </div>
     <div id="strip" class="strip" hidden></div>
 
     <footer class="controls">
-      <button class="ctrl" id="btnCam" data-act="cam" title="Ligar câmera"><i data-icon="camoff"></i></button>
-      <button class="ctrl" id="btnShare" data-act="share" title="Transmitir tela"><i data-icon="screen"></i></button>
-      <button class="ctrl" id="btnChat" data-act="toggle-chat" title="Chat"><i data-icon="chat"></i></button>
-      <button class="ctrl leave" data-act="leave" title="Sair da sala"><i data-icon="leave"></i></button>
+      <button class="ctrl" id="btnCam" data-act="cam" title="Ligar câmera"><i class="fa-solid fa-video-slash"></i></button>
+      <button class="ctrl share" id="btnShare" data-act="share" title="Transmitir tela"><i class="fa-solid fa-display"></i></button>
+      <button class="ctrl" id="btnMembers" data-act="toggle-members" title="Mostrar membros abaixo da tela"><i class="fa-solid fa-user-group"></i></button>
+      <button class="ctrl leave" data-act="leave" title="Sair da sala"><i class="fa-solid fa-phone hangup"></i></button>
     </footer>
   </main>
 
   <aside id="chat" class="chat">
     <header class="chat-head">
-      <span class="hash">#</span> chat-da-sala
-      <button class="icon-btn" data-act="toggle-chat" title="Fechar chat"><i data-icon="x"></i></button>
+      <span class="hash">#</span><span>chat-da-sala</span><span class="dot"></span>
+      <button class="icon-btn" data-act="toggle-chat" title="Fechar chat"><i class="fa-solid fa-xmark"></i></button>
     </header>
+    <div class="chat-deco" aria-hidden="true"><i></i><span>共有する</span><i></i></div>
     <div id="msgs" class="msgs"></div>
     <form id="chatForm" class="chat-form" autocomplete="off">
-      <input id="chatInput" maxlength="1000" placeholder="Conversar na sala">
-      <button type="submit" class="send" title="Enviar"><i data-icon="send"></i></button>
+      <input id="chatInput" maxlength="1000" placeholder="Conversar na sala...">
+      <button type="submit" class="send" title="Enviar"><i class="fa-solid fa-paper-plane"></i></button>
     </form>
   </aside>
 </section>
@@ -109,7 +145,7 @@
 <!-- ============ MODAL: IR AO VIVO ============ -->
 <div id="liveModal" class="modal" hidden>
   <div class="modal-card">
-    <button class="icon-btn modal-x" data-act="close-modal" title="Fechar"><i data-icon="x"></i></button>
+    <button class="icon-btn modal-x" data-act="close-modal" title="Fechar"><i class="fa-solid fa-xmark"></i></button>
     <h2 id="liveTitle">Transmitir tela</h2>
     <p class="muted" id="liveDesc">Escolha a qualidade. Em seguida, selecione a tela inteira, uma janela ou uma guia.</p>
     <div class="opt-label">RESOLUÇÃO</div>
@@ -134,12 +170,12 @@
 <!-- ============ MODAL: SALA CRIADA ============ -->
 <div id="linkModal" class="modal" hidden>
   <div class="modal-card">
-    <button class="icon-btn modal-x" data-act="close-modal" title="Fechar"><i data-icon="x"></i></button>
+    <button class="icon-btn modal-x" data-act="close-modal" title="Fechar"><i class="fa-solid fa-xmark"></i></button>
     <h2>Sala criada!</h2>
     <p class="muted">Envie este link para seus amigos entrarem e assistirem.</p>
     <div class="link-row">
       <input id="linkInput" readonly>
-      <button class="btn primary" data-act="copy">Copiar</button>
+      <button class="btn primary" data-act="copy"><i class="fa-solid fa-copy"></i><span>Copiar</span></button>
     </div>
     <div class="modal-actions">
       <button class="btn ghost" data-act="close-modal">Pronto</button>

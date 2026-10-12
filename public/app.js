@@ -6,7 +6,7 @@
  *  - A tela SÓ é enviada para quem clicou em "Assistir". Ninguém assistindo = nenhum
  *    custo de codificação/upload além da captura.
  *  - A captura já sai na resolução/FPS escolhidos (o navegador reduz na origem),
- *    e o codec H.264 é priorizado porque costuma usar aceleração de hardware.
+ *    e o codec VP8 é priorizado (veja preferCodecs: o H.264 por hardware da AMD travava).
  *  - Ao parar de assistir, a conexão é fechada e o decodificador é liberado.
  */
 'use strict';
@@ -15,29 +15,26 @@
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// Ícones: Font Awesome Free (link no <head> do index.html)
 const ICONS = {
-  speaker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M16.5 9a4 4 0 0 1 0 6M19 6.5a8 8 0 0 1 0 11"/></svg>',
-  mute: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor"/><path d="M17 9.5l5 5M22 9.5l-5 5"/></svg>',
-  cam: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="13" height="12" rx="2.5"/><path d="M15.5 10.5l6-3.5v10l-6-3.5"/></svg>',
-  camoff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="13" height="12" rx="2.5"/><path d="M15.5 10.5l6-3.5v10l-6-3.5M3 3l18 18"/></svg>',
-  screen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
-  screenstop: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4M9.5 8l5 5M14.5 8l-5 5"/></svg>',
-  leave: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-3.2 0-6.2.9-8.6 2.6-.6.4-.9 1.1-.8 1.8l.3 2c.1.8.9 1.3 1.7 1.1l3-.8c.6-.2 1-.7 1-1.3v-1.9c1.1-.4 2.2-.5 3.4-.5s2.3.1 3.4.5v1.9c0 .6.4 1.1 1 1.3l3 .8c.8.2 1.6-.3 1.7-1.1l.3-2c.1-.7-.2-1.4-.8-1.8C18.2 9.9 15.2 9 12 9z"/></svg>',
-  chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H9.5L4 20z"/></svg>',
-  link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></svg>',
-  eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>',
-  full: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
-  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-  menu: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>',
-  userplus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-6.5 7-6.5s7 2.5 7 6.5M19 8v6M16 11h6"/></svg>',
-  chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
-  signal: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="14" width="4" height="7" rx="1"/><rect x="10" y="9" width="4" height="12" rx="1"/><rect x="17" y="4" width="4" height="17" rx="1"/></svg>',
-  send: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 20.5l18-8.5L3 3.5 3 10l12 2-12 2z"/></svg>',
+  speaker: 'fa-solid fa-volume-high',
+  mute: 'fa-solid fa-volume-xmark',
+  cam: 'fa-solid fa-video',
+  camoff: 'fa-solid fa-video-slash',
+  screen: 'fa-solid fa-display',
+  leave: 'fa-solid fa-phone hangup',
+  chat: 'fa-regular fa-message',
+  link: 'fa-solid fa-link',
+  eye: 'fa-solid fa-eye',
+  full: 'fa-solid fa-expand',
+  x: 'fa-solid fa-xmark',
+  users: 'fa-solid fa-user-group',
+  live: 'fa-solid fa-tower-broadcast',
+  play: 'fa-solid fa-play',
+  layers: 'fa-solid fa-table-columns',
+  stop: 'fa-solid fa-stop',
 };
-function icon(name) { return ICONS[name] || ''; }
-function hydrateIcons(root = document) {
-  root.querySelectorAll('i[data-icon]').forEach((i) => { i.innerHTML = icon(i.dataset.icon); });
-}
+function icon(name) { return ICONS[name] ? `<i class="${ICONS[name]}" aria-hidden="true"></i>` : ''; }
 
 const COLORS = ['#e3242b', '#a8161c', '#5d5d68', '#c2185b', '#3d3d46', '#ff5a5f', '#7b1f24', '#80808c'];
 function colorFor(nick) {
@@ -71,7 +68,7 @@ const QUALITY = {
   1080: { w: 1920, h: 1080, br: { 30: 4_500_000, 60: 7_000_000 } },
 };
 const CAM = { w: 640, h: 360, fps: 24, br: 500_000 };
-const MAX_WATCH = 4;
+const MAX_WATCH = 2; // no máximo 2 telas lado a lado
 
 const S = {
   ws: null,
@@ -88,7 +85,8 @@ const S = {
   watched: [], // ids das telas que estou assistindo (pode incluir a minha)
   pcs: new Map(), // `${role}:${kind}:${peerId}` -> entry
   muted: new Set(), // telas que eu silenciei
-  chatOpen: window.innerWidth > 1100,
+  chatOpen: window.innerWidth > 1200,
+  showMembers: false, // fileira de membros abaixo da tela (botão de pessoas)
   unread: 0,
   leaving: false,
   rtc: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
@@ -111,7 +109,6 @@ const DEVICE_ID = (() => {
 
 // ---------------------------------------------------------------- entrada
 function initLanding() {
-  hydrateIcons();
   const params = new URLSearchParams(location.search);
   const invited = (params.get('sala') || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const nickInput = $('#nick');
@@ -121,20 +118,13 @@ function initLanding() {
     if (q && QUALITY[q.res] && (q.fps === 30 || q.fps === 60)) S.quality = { ...S.quality, ...q };
   } catch {}
 
-  let mode = 'create';
-  if (invited.length >= 4) {
-    mode = 'join';
-    $('#inviteBox').hidden = false;
-    $('#inviteRoom').textContent = invited;
-    $('#mainBtn').textContent = 'Entrar na sala';
-    $('#altBtn').hidden = false;
-  }
+  let mode = invited.length >= 4 ? 'join' : 'create';
+  setLandingMode(mode, invited);
   $('#altBtn').onclick = () => {
     mode = 'create';
-    $('#inviteBox').hidden = true;
-    $('#altBtn').hidden = true;
-    $('#mainBtn').textContent = 'Criar sala';
+    setLandingMode('create');
     history.replaceState(null, '', location.pathname);
+    nickInput.focus();
   };
 
   if (!window.isSecureContext) {
@@ -157,6 +147,25 @@ function initLanding() {
   fetch('/config.json').then((r) => r.json()).then((c) => { if (c && c.iceServers) S.rtc = c; }).catch(() => {});
 }
 
+// Link padrão: "Crie uma sala". Link de convite: "Entre na sala <código>".
+function setLandingMode(mode, code) {
+  const join = mode === 'join';
+  $('#landTitle').textContent = join ? 'Entre na sala' : 'Crie uma sala';
+  $('#landRoom').textContent = join ? code : '';
+  $('#landRoom').hidden = !join;
+  $('#mainBtn span').textContent = join ? 'Entrar na sala' : 'Criar sala';
+  $('#altBox').hidden = !join;
+}
+
+function resetChat() {
+  $('#msgs').innerHTML = `<div id="chatEmpty" class="chat-empty">
+    <i class="fa-regular fa-comment-dots"></i>
+    <b>Bem-vindo(a) à sala!</b>
+    <p>Envie mensagens, compartilhe links, organize ideias e mantenha o foco.</p>
+  </div>`;
+  S.lastMsg = null;
+}
+
 function roomLink() {
   return `${location.origin}${location.pathname}?sala=${S.room}`;
 }
@@ -172,8 +181,7 @@ function enterRoom(created) {
   $('#vsSub').textContent = `MRP Live Room / ${S.room}`;
   $('#meNick').textContent = S.nick;
   $('#meAvatar').outerHTML = avatarHTML(S.nick, 'avatar" id="meAvatar');
-  $('#msgs').innerHTML = '';
-  S.lastMsg = null;
+  resetChat();
   setChatOpen(S.chatOpen);
   if (created) {
     $('#linkInput').value = roomLink();
@@ -761,12 +769,8 @@ function watch(id, simultaneous) {
     for (const w of S.watched) if (w !== id && w !== S.me) dropSub('screen', w, true);
     S.watched = [id];
   } else if (!S.watched.includes(id)) {
-    if (!S.watched.length) {
-      // nada aberto: abre esta e as demais transmissões ao vivo lado a lado
-      S.watched = [id, ...liveIds().filter((x) => x !== id && x !== S.me)];
-    } else {
-      S.watched.push(id);
-    }
+    // lado a lado; passando do limite, sai a tela aberta há mais tempo
+    S.watched.push(id);
     while (S.watched.length > MAX_WATCH) {
       const drop = S.watched.shift();
       if (drop !== S.me) dropSub('screen', drop, true);
@@ -788,7 +792,6 @@ function render() {
   S.watched = S.watched.filter(isLive);
   if (S.ws && S.watched.filter((id) => id !== S.me).join(',') !== S.sentWatching) pushState();
   renderMembers();
-  renderLiveBar();
   renderStage();
   renderControls();
 }
@@ -805,8 +808,26 @@ function actionButtons(id) {
   }
   if (watching) return `<button class="mini" data-act="unwatch" data-id="${id}">Parar de assistir</button>`;
   let h = `<button class="mini red" data-act="watch" data-id="${id}">Assistir agora</button>`;
-  if (liveIds().length >= 2) h += `<button class="mini outline" data-act="watchadd" data-id="${id}">Assistir simultaneamente</button>`;
+  if (S.watched.length && S.watched.length < MAX_WATCH) h += `<button class="mini outline" data-act="watchadd" data-id="${id}">Assistir simultaneamente</button>`;
   return h;
+}
+
+// Botões do aviso "alguém está compartilhando" (quando a tela ainda não está aberta)
+function noticeButtons(id) {
+  const p = info(id);
+  const n = S.watched.length;
+  if (p.me) {
+    return `<button class="btn primary" data-act="watchauto" data-id="${id}">${icon('eye')}<span>Ver minha prévia</span></button>
+      <button class="n-alt" data-act="stoplive">Parar transmissão</button>`;
+  }
+  if (n === 0) return `<button class="btn primary" data-act="watch" data-id="${id}">${icon('play')}<span>Assistir</span></button>`;
+  if (n < MAX_WATCH) {
+    return `<button class="btn primary" data-act="watchadd" data-id="${id}">${icon('layers')}<span>Assistir simultaneamente</span></button>
+      <button class="n-alt" data-act="watch" data-id="${id}">ou assistir só esta</button>`;
+  }
+  const oldest = info(S.watched[0]);
+  return `<button class="btn primary" data-act="watchadd" data-id="${id}">${icon('play')}<span>Assistir</span></button>
+    <span class="n-hint">Limite de 2 telas: substitui a de ${esc(oldest ? oldest.nick : 'outra pessoa')}</span>`;
 }
 
 function renderMembers() {
@@ -830,8 +851,9 @@ function renderMembers() {
   $('#headInfo').textContent = `${n} ${n === 1 ? 'pessoa' : 'pessoas'} na sala`;
   const st = $('#meStatus');
   const cap = liveHealth.capture != null ? ` · captura ${liveHealth.capture}fps` : '';
-  st.textContent = S.self.live ? `Ao vivo · ${S.self.q}${cap} · ${viewersOf(S.me)} assistindo` : 'Online';
-  st.classList.toggle('live', S.self.live);
+  st.textContent = S.self.live ? `${S.self.q}${cap} · ${viewersOf(S.me)} assistindo` : 'Online';
+  // No lugar de microfone/fone/engrenagem: selo "Ao vivo" só quando transmitindo
+  $('#meLive').hidden = !S.self.live;
 }
 
 // ------------------------------------------------------------ diagnóstico
@@ -947,22 +969,6 @@ setInterval(async () => {
   renderMembers();
 }, 2000);
 
-function renderLiveBar() {
-  const bar = $('#liveBar');
-  const live = liveIds();
-  if (!live.length) { bar.hidden = true; bar.innerHTML = ''; return; }
-  let html = '<span class="lb-title">AO VIVO AGORA</span>';
-  for (const id of live) {
-    const p = info(id);
-    html += `<div class="chip${S.watched.includes(id) ? ' watching' : ''}">${avatarHTML(p.nick, 'avatar', true)}<span class="chip-name">${esc(p.nick)}${p.me ? ' (você)' : ''}</span>${actionButtons(id)}</div>`;
-  }
-  if (S.watched.filter((id) => id !== S.me).length >= 2) {
-    html += '<button class="mini" data-act="unwatch-all">Parar de assistir todas</button>';
-  }
-  if (bar._html !== html) { bar.innerHTML = html; bar._html = html; }
-  bar.hidden = false;
-}
-
 // Tiles são reaproveitados entre renders (vídeos não são recriados)
 const tiles = new Map();
 
@@ -1074,6 +1080,22 @@ setInterval(async () => {
   }
 }, 2000);
 
+// Aviso no lugar de uma tela que está ao vivo mas não está aberta
+function updateNoticeTile(t, id) {
+  const p = info(id);
+  t.className = 'tile notice';
+  setVideo(t._video, null, true);
+  const who = p.me ? 'Você está' : `<b>${esc(p.nick)}</b> está`;
+  setUI(t, `<div class="n-user">${avatarHTML(p.nick, 'avatar', true)}<b>${esc(p.nick)}${p.me ? ' (você)' : ''}</b><span class="live-badge">AO VIVO</span></div>
+    <div class="n-body">
+      <div class="n-ic"><span class="bar"></span><span class="scr"><i class="fa-solid fa-display"></i><i class="fa-solid fa-arrow-up"></i></span><span class="bar"></span></div>
+      <h3>Compartilhamento de tela</h3>
+      <p>${who} compartilhando a tela.<br>${p.me ? 'Seus amigos já podem assistir.' : 'Aproveite a transmissão!'}</p>
+      <div class="n-btns">${noticeButtons(id)}</div>
+      <span class="n-line"></span>
+    </div>`);
+}
+
 function updatePersonTile(t, id) {
   const p = info(id);
   const stream = p.cam ? streamFor('cam', id) : null;
@@ -1091,12 +1113,19 @@ function renderStage() {
   const strip = $('#strip');
   const people = participants();
   const screens = S.watched.filter(isLive);
+  const live = liveIds();
 
   // Plano: [container, chave, atualizar, id]
+  // Com alguém ao vivo, o palco se divide em partes iguais, uma por tela:
+  // aberta = vídeo; não aberta = aviso com "Assistir".
+  // Os membros vão para a fileira abaixo, só se o botão de pessoas estiver ligado.
   const plan = [];
-  if (screens.length) {
-    for (const id of screens) plan.push([stage, `s:${id}`, updateScreenTile, id]);
-    for (const p of people) plan.push([strip, `p:${p.id}`, updatePersonTile, p.id]);
+  if (live.length) {
+    for (const id of live) {
+      if (screens.includes(id)) plan.push([stage, `s:${id}`, updateScreenTile, id]);
+      else plan.push([stage, `n:${id}`, updateNoticeTile, id]);
+    }
+    if (S.showMembers) for (const p of people) plan.push([strip, `p:${p.id}`, updatePersonTile, p.id]);
   } else {
     for (const p of people) plan.push([stage, `p:${p.id}`, updatePersonTile, p.id]);
   }
@@ -1129,8 +1158,8 @@ function renderStage() {
     pos.set(container, [...container.children].indexOf(t) + 1);
   }
 
-  stage.className = screens.length ? `stage screens n${Math.min(screens.length, 4)}` : 'stage grid';
-  strip.hidden = !screens.length;
+  stage.className = live.length ? `stage panels n${Math.min(live.length, 4)}` : 'stage grid';
+  strip.hidden = !(live.length && S.showMembers);
   if (!screens.includes(S.me)) dropPreview();
   fitGrid();
 }
@@ -1161,16 +1190,17 @@ function renderControls() {
   const live = !!S.screenStream;
   const bc = $('#btnCam');
   bc.classList.toggle('on', cam);
+  bc.classList.toggle('off', !cam);
   bc.title = cam ? 'Desligar câmera' : 'Ligar câmera';
   bc.innerHTML = icon(cam ? 'cam' : 'camoff');
   const bs = $('#btnShare');
   bs.classList.toggle('live', live);
   bs.title = live ? 'Opções da transmissão' : 'Transmitir tela';
-  bs.innerHTML = icon(live ? 'screenstop' : 'screen');
   $('#sideCam').classList.toggle('on', cam);
   $('#sideShare').classList.toggle('on', live);
   $('#sideShare span').textContent = live ? 'Ao vivo' : 'Tela';
-  $('#btnChat').classList.toggle('on', S.chatOpen);
+  $('#btnMembers').classList.toggle('active', S.showMembers);
+  $('#headMembers').classList.toggle('on', S.showMembers);
 }
 
 function toggleFullscreen(tile) {
@@ -1234,6 +1264,8 @@ function appendToMsgs(node) {
 }
 
 function addChat(msg, history) {
+  const empty = $('#chatEmpty');
+  if (empty) empty.remove();
   const grouped = S.lastMsg && S.lastMsg.from === msg.from && msg.ts - S.lastMsg.ts < 5 * 60 * 1000;
   S.lastMsg = msg;
   let node;
@@ -1336,9 +1368,8 @@ function leaveRoom() {
   closeModals();
   $('#room').hidden = true;
   $('#landing').hidden = false;
-  $('#inviteBox').hidden = true;
-  $('#altBtn').hidden = true;
-  $('#mainBtn').textContent = 'Criar sala';
+  setLandingMode('create');
+  S.showMembers = false;
   history.replaceState(null, '', location.pathname);
   document.title = 'MRP Live Room';
   initLandingModeCreate();
@@ -1376,6 +1407,12 @@ document.addEventListener('click', (e) => {
   switch (b.dataset.act) {
     case 'watch': watch(id, false); break;
     case 'watchadd': watch(id, true); break;
+    case 'watchauto': watch(id, S.watched.length > 0); break;
+    case 'toggle-members':
+      S.showMembers = !S.showMembers;
+      if (S.showMembers && !liveIds().length) toast('Os membros já aparecem no palco. A fileira abaixo da tela aparece quando alguém estiver transmitindo.', 4000);
+      render();
+      break;
     case 'unwatch': unwatch(id); break;
     case 'unwatch-all':
       for (const w of [...S.watched]) unwatch(w);
