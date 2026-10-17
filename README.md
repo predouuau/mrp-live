@@ -19,13 +19,30 @@ Navegadores só permitem compartilhar tela/câmera em **HTTPS** (ou em `localhos
 - **Hospedar (recomendado):** suba esta pasta no Render, Railway, Fly.io ou numa VPS. O comando de start é `node server.js`, e a porta vem da variável `PORT`.
 - **Túnel temporário a partir do seu PC:** com o servidor rodando, use `cloudflared tunnel --url http://localhost:3000` (ou o ngrok) e envie o link `https://...` gerado.
 
-### TURN (opcional)
+### TURN: a "ponte" para redes que bloqueiam conexão direta
 
-A conexão é direta entre os navegadores (P2P), usando STUN. Em algumas redes (4G, redes corporativas, NAT simétrico) a conexão direta falha. Nesses casos, configure um servidor TURN:
+A conexão é direta entre os navegadores (P2P), usando STUN. Algumas redes bloqueiam essa conexão: 4G, redes corporativas, CGNAT de operadora. Quando isso acontece, quem assiste fica vendo "Reconectando à tela de...". A solução é um servidor TURN. Quem consegue conexão direta continua usando a conexão direta; só quem está bloqueado passa pela ponte.
 
+**Cloudflare (recomendado):** os primeiros 1.000 GB por mês são grátis. Uma hora de 1080p para uma pessoa gasta cerca de 2 GB.
+
+1. No painel da Cloudflare, vá em **Realtime → TURN Server** e crie uma chave (**Create**).
+2. Anote o **Turn Token ID** e o **API Token**. Este segundo aparece uma vez só.
+3. No Render, abra o serviço, vá em **Environment** e adicione:
+   - `CF_TURN_KEY_ID` = Turn Token ID
+   - `CF_TURN_API_TOKEN` = API Token
+4. Salve. O Render reinicia o servidor, e o log deve mostrar `TURN Cloudflare: ativo`.
+
+**TURN próprio (opcional):**
 ```
 TURN_URL=turn:seu-servidor:3478   TURN_USER=usuario   TURN_PASS=senha
 ```
+
+## Recursos
+
+- **Prévia sincronizada:** quem transmite vê a própria tela com o mesmo fps e a mesma resolução que os amigos estão recebendo. O quadro mostra, por exemplo, "seu amigo recebe: 720p · 58fps", e avisa quando a imagem trava do lado de alguém.
+- **Volume por transmissão:** cada tela com som tem um controle de volume.
+- **Duas telas ao mesmo tempo:** clicar em uma delas faz ela ocupar o palco inteiro. O botão "Ver as duas telas" volta na hora, porque a outra tela continua conectada.
+- **Reconexão automática:** se a conexão com o servidor cair (troca de Wi-Fi, 4G, internet saturada), o site percebe em até ~20 s e volta sozinho, com a mesma vaga. O vídeo continua passando durante a queda. Quem fecha a guia ou clica em Sair sai na hora.
 
 ## Como funciona e por que é leve
 
@@ -41,6 +58,9 @@ TURN_URL=turn:seu-servidor:3478   TURN_USER=usuario   TURN_PASS=senha
 - **A fluidez vem antes da nitidez:** se a rede ou o PC apertarem, a imagem perde um pouco de nitidez, mas os quadros por segundo se mantêm.
 - **Buffer de 120 ms para quem assiste:** absorve as oscilações da rede sem engasgar.
 - **Indicador no quadro:** mostra a resolução e o fps que estão chegando de verdade.
+- **Câmeras só quando aparecem na tela:** com alguém transmitindo e a fileira de membros fechada, as câmeras não são recebidas.
+- **Um único ciclo de estatísticas a cada 2 s**, compartilhado por todas as funções.
+- **Logo reduzida para 700 px:** o arquivo foi de 1,6 MB para 277 KB. O original está em `originais/`.
 
 | Qualidade | 30 fps    | 60 fps   |
 |-----------|-----------|----------|

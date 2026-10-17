@@ -32,6 +32,7 @@ const ICONS = {
   live: 'fa-solid fa-tower-broadcast',
   play: 'fa-solid fa-play',
   layers: 'fa-solid fa-table-columns',
+  expand: 'fa-solid fa-up-right-and-down-left-from-center',
   stop: 'fa-solid fa-stop',
 };
 function icon(name) { return ICONS[name] ? `<i class="${ICONS[name]}" aria-hidden="true"></i>` : ''; }
@@ -85,11 +86,15 @@ const S = {
   watched: [], // ids das telas que estou assistindo (pode incluir a minha)
   pcs: new Map(), // `${role}:${kind}:${peerId}` -> entry
   muted: new Set(), // telas que eu silenciei
+  volumes: new Map(), // volume de cada tela (0 a 1)
+  focus: null, // tela ampliada quando há 2 abertas
   chatOpen: window.innerWidth > 1200,
   showMembers: false, // fileira de membros abaixo da tela (botão de pessoas)
   unread: 0,
   leaving: false,
   rtc: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
+  rtcReady: null, // promessa da configuração STUN/TURN vinda do servidor
+  hasTurn: false,
   lastMsg: null,
 };
 
@@ -144,7 +149,14 @@ function initLanding() {
   };
   nickInput.focus();
 
-  fetch('/config.json').then((r) => r.json()).then((c) => { if (c && c.iceServers) S.rtc = c; }).catch(() => {});
+  // Servidores STUN/TURN (o TURN é a "ponte" para redes que bloqueiam conexão direta)
+  S.rtcReady = fetch('/config.json')
+    .then((r) => r.json())
+    .then((c) => {
+      if (c && c.iceServers) S.rtc = { iceServers: c.iceServers };
+      S.hasTurn = !!(c && c.turn);
+    })
+    .catch(() => {});
 }
 
 // Link padrão: "Crie uma sala". Link de convite: "Entre na sala <código>".
@@ -187,7 +199,8 @@ function enterRoom(created) {
     $('#linkInput').value = roomLink();
     $('#linkModal').hidden = false;
   }
-  connect();
+  // só conecta depois de saber os servidores TURN (no máximo 4s de espera)
+  Promise.race([S.rtcReady, new Promise((r) => setTimeout(r, 4000))]).then(() => { if (S.room && !S.leaving) connect(); });
   render();
 }
 
@@ -202,43 +215,182 @@ function pushState() {
   send({ t: 'state', ...S.self, relay: !IS_MOBILE, watching });
 }
 
+// ------------------------------------------------- conexão com o servidor
+// Bug corrigido: a conexão podia "morrer em silêncio" (troca de Wi-Fi, 4G,
+// internet saturada pela transmissão). O servidor tirava a pessoa da sala, mas o
+// navegador achava que continuava conectado e nunca tentava voltar — só fechando
+// e abrindo o site. Agora:
+//  - a cada 5s o site manda um "ping" e o servidor responde; sem resposta em 20s,
+//    a conexão é considerada morta e refeita na hora;
+//  - as tentativas seguem com espera crescente (1s, 2s, 4s… até 10s), sem desistir;
+//  - ao voltar, reabre sozinho as telas que a pessoa estava assistindo.
+const NET = { attempt: 0, timer: 0, lastMsg: 0, openedAt: 0 };
+
 function connect() {
+  clearTimeout(NET.timer);
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   S.ws = ws;
-  ws.onopen = () => send({ t: 'join', room: S.room, nick: S.nick, device: DEVICE_ID });
+  NET.openedAt = Date.now();
+  ws.onopen = () => {
+    NET.lastMsg = Date.now();
+    send({ t: 'join', room: S.room, nick: S.nick, device: DEVICE_ID });
+  };
   ws.onmessage = (e) => {
+    NET.lastMsg = Date.now();
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
     handle(m).catch((err) => console.warn(err));
   };
   ws.onclose = () => {
-    if (S.ws !== ws || S.leaving) return;
-    resetConnections();
-    toast('Conexão perdida. Reconectando…');
-    setTimeout(() => { if (!S.leaving && S.ws === ws) connect(); }, 1500);
+    if (S.ws === ws && !S.leaving) connectionLost();
   };
 }
 
+function connectionLost() {
+  const old = S.ws;
+  S.ws = null;
+  if (old) {
+    old.onclose = null;
+    old.onmessage = null;
+    try { old.close(); } catch {}
+  }
+  if (S.leaving || !S.room) return;
+  if (NET.attempt === 0) {
+    // As conexões de vídeo NÃO são fechadas: elas vão direto entre os navegadores
+    // e costumam continuar funcionando enquanto a conexão com o servidor volta.
+    S.reconnecting = true;
+    setNetBanner(true);
+  }
+  const delay = Math.min(10000, 1000 * 2 ** NET.attempt);
+  NET.attempt++;
+  clearTimeout(NET.timer);
+  NET.timer = setTimeout(() => { if (!S.leaving && S.room) connect(); }, delay);
+}
+
+// Reconecta já, sem esperar a próxima tentativa (internet voltou / voltou para a guia)
+function reconnectNow() {
+  if (S.leaving || !S.room) return;
+  if (S.ws && S.ws.readyState === 1 && Date.now() - NET.lastMsg < 20000) return;
+  clearTimeout(NET.timer);
+  if (S.ws) connectionLost();
+  clearTimeout(NET.timer);
+  connect();
+}
+
+setInterval(() => {
+  if (!S.ws || S.leaving) return;
+  if (S.ws.readyState === 1) {
+    send({ t: 'ping' });
+    if (Date.now() - NET.lastMsg > 20000) connectionLost(); // morreu em silêncio
+  } else if (S.ws.readyState === 0 && Date.now() - NET.openedAt > 10000) {
+    connectionLost(); // travou tentando conectar
+  }
+}, 5000);
+
+window.addEventListener('online', reconnectNow);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) reconnectNow(); });
+
+function setNetBanner(on) {
+  let b = $('#netBanner');
+  if (on && !b) {
+    b = document.createElement('div');
+    b.id = 'netBanner';
+    b.className = 'net-banner';
+    b.innerHTML = '<span class="net-spin"></span>Conexão perdida. Reconectando…';
+    document.body.appendChild(b);
+  } else if (!on && b) b.remove();
+}
+
 function resetConnections() {
+  // guarda o que estava assistindo para reabrir sozinho ao reconectar
+  S.rewatch = S.watched.slice();
   for (const key of [...S.pcs.keys()]) closePc(key);
   S.peers.clear();
-  S.watched = S.watched.filter((id) => id === S.me);
+  rxReports.clear();
   render();
+}
+
+// Quem caiu e voltou ganha outro id. Se eu assistia a tela dessa pessoa, volto a
+// assistir sozinho quando ela reaparecer transmitindo.
+const pendingRewatch = new Map(); // id antigo -> quando saiu
+const autoWatch = new Set(); // id novo -> reabrir quando estiver ao vivo
+const rewatchNicks = new Map(); // servidor reiniciou: nome de quem eu assistia -> quando
+
+function rewatchIfNeeded(p) {
+  if (!p.live) return;
+  if (autoWatch.has(p.id)) {
+    autoWatch.delete(p.id);
+    if (!S.watched.includes(p.id)) {
+      S.watched.push(p.id);
+      while (S.watched.length > MAX_WATCH) {
+        const drop = S.watched.shift();
+        if (drop !== S.me) dropSub('screen', drop, true);
+      }
+    }
+  }
+  if (S.watched.includes(p.id) && !S.pcs.has(subKey('screen', p.id))) subscribe('screen', p.id);
 }
 
 async function handle(m) {
   switch (m.t) {
+    case 'pong':
+      break;
     case 'joined': {
-      const wasWatchingSelf = S.watched.includes(S.me);
+      const back = S.reconnecting;
+      S.reconnecting = false;
+      NET.attempt = 0;
+      setNetBanner(false);
+
+      if (m.resumed && m.id === S.me) {
+        // Voltou para a MESMA vaga: as conexões de vídeo continuaram funcionando
+        // durante a queda; só atualiza quem está na sala e fecha o que sumiu.
+        S.peers.clear();
+        for (const p of m.peers) S.peers.set(p.id, p);
+        for (const [k, en] of [...S.pcs]) {
+          if (!S.pcs.has(k)) continue;
+          if (en.role === 'sub' && !S.peers.has(en.o)) dropSub(en.kind, en.o, false);
+          else if (en.role === 'sub' && en.peer !== en.o && !S.peers.has(en.peer)) resubscribe(en.kind, en.o, 300);
+          else if (en.role === 'pub' && !S.peers.has(en.peer)) closePc(k);
+        }
+        S.watched = S.watched.filter((id) => (id === S.me ? S.self.live : (S.peers.get(id) || {}).live));
+        for (const id of S.watched) if (id !== S.me && !S.pcs.has(subKey('screen', id))) subscribe('screen', id);
+        if (back) toast('Reconectado!');
+        pushState();
+        render();
+        break;
+      }
+
+      // Entrada nova (ou voltou com outro id): recomeça as conexões de vídeo
+      const prevMe = S.me;
+      // Se o servidor reiniciou, todo mundo ganha id novo: guarda os NOMES de quem
+      // eu assistia para reabrir essas telas quando as pessoas reaparecerem.
+      const oldNicks = back
+        ? S.watched.filter((id) => id !== S.me).map((id) => (S.peers.get(id) || {}).nick).filter(Boolean)
+        : [];
+      if (back) {
+        S.rewatch = S.watched.slice();
+        for (const k of [...S.pcs.keys()]) closePc(k);
+        rxReports.clear();
+      }
       S.me = m.id;
-      S.watched = wasWatchingSelf ? [S.me] : [];
       S.peers.clear();
       for (const p of m.peers) S.peers.set(p.id, p);
-      if (!$('#msgs').childElementCount) for (const msg of m.chat) addChat(msg, true);
-      sysMsg(`Você entrou na sala <b>${esc(S.room)}</b>`);
+      // reabre as telas que estava assistindo antes de cair
+      const rewatch = (S.rewatch || S.watched).map((id) => (id === prevMe ? S.me : id));
+      S.rewatch = null;
+      S.watched = rewatch.filter((id) => (id === S.me ? S.self.live : (S.peers.get(id) || {}).live));
+      if (S.focus === prevMe) S.focus = S.me;
+      if (!$('#msgs .msg, #msgs .sys')) for (const msg of m.chat) addChat(msg, true);
+      if (back) toast('Reconectado!');
+      else sysMsg(`Você entrou na sala <b>${esc(S.room)}</b>`);
       pushState();
-      for (const p of S.peers.values()) if (p.cam) subscribe('cam', p.id);
+      for (const id of S.watched) if (id !== S.me) subscribe('screen', id);
+      for (const nick of oldNicks) {
+        const p = [...S.peers.values()].find((x) => x.nick === nick);
+        if (p && !S.watched.includes(p.id)) { autoWatch.add(p.id); rewatchIfNeeded(p); }
+        else if (!p) rewatchNicks.set(nick, Date.now());
+      }
       render();
       break;
     }
@@ -246,32 +398,46 @@ async function handle(m) {
       toast(m.msg || 'Erro');
       if (m.fatal) leaveRoom();
       break;
-    case 'peer-join':
+    case 'peer-join': {
       S.peers.set(m.peer.id, m.peer);
+      if (m.prev && pendingRewatch.has(m.prev)) {
+        pendingRewatch.delete(m.prev);
+        autoWatch.add(m.peer.id);
+        if (S.focus === m.prev) S.focus = m.peer.id;
+      }
+      const t0 = rewatchNicks.get(m.peer.nick);
+      if (t0) {
+        rewatchNicks.delete(m.peer.nick);
+        if (Date.now() - t0 < 120000) autoWatch.add(m.peer.id);
+      }
       if (!m.rejoin) sysMsg(`<b>${esc(m.peer.nick)}</b> entrou na sala`);
-      if (m.peer.cam) subscribe('cam', m.peer.id);
+      rewatchIfNeeded(m.peer);
       render();
       break;
+    }
     case 'peer-state': {
       const p = m.peer;
       const prev = S.peers.get(p.id);
       if (!prev) return;
       S.peers.set(p.id, p);
-      if (!prev.cam && p.cam) subscribe('cam', p.id);
-      if (prev.cam && !p.cam) dropSub('cam', p.id, false);
       if (!prev.live && p.live) sysMsg(`<b>${esc(p.nick)}</b> começou a transmitir`, true);
       if (prev.live && !p.live) {
         dropSub('screen', p.id, false);
         S.watched = S.watched.filter((id) => id !== p.id);
         sysMsg(`<b>${esc(p.nick)}</b> parou de transmitir`);
       }
+      rewatchIfNeeded(p);
       render();
       break;
     }
     case 'peer-leave': {
       const p = S.peers.get(m.id);
+      // saída "silenciosa" = caiu e está voltando: lembra se eu assistia
+      if (m.quiet && S.watched.includes(m.id)) pendingRewatch.set(m.id, Date.now());
+      for (const [id, t] of pendingRewatch) if (Date.now() - t > 120000) pendingRewatch.delete(id);
       S.peers.delete(m.id);
       S.watched = S.watched.filter((id) => id !== m.id);
+      rxReports.delete(m.id);
       for (const [k, en] of [...S.pcs]) {
         if (!S.pcs.has(k)) continue;
         if (en.role === 'sub' && en.o === m.id) dropSub(en.kind, en.o, false); // origem saiu
@@ -425,7 +591,21 @@ function children(kind, o) {
 function wanted(kind, o) {
   const p = S.peers.get(o);
   if (!p) return false;
-  return kind === 'screen' ? p.live && S.watched.includes(o) : p.cam;
+  return kind === 'screen' ? p.live && S.watched.includes(o) : p.cam && camsVisible();
+}
+
+// Câmeras só aparecem no palco (ninguém transmitindo) ou na fileira de membros.
+// Fora disso não são recebidas: cada câmera recebida é um vídeo a mais sendo
+// decodificado, gastando processador e memória sem ninguém ver.
+function camsVisible() { return !liveIds().length || S.showMembers; }
+
+function syncCams() {
+  for (const p of S.peers.values()) {
+    const want = wanted('cam', p.id);
+    const has = S.pcs.has(subKey('cam', p.id));
+    if (want && !has) subscribe('cam', p.id);
+    else if (!want && has) dropSub('cam', p.id, true);
+  }
 }
 
 // Lado de quem ASSISTE: pede a transmissão de `o` (direto ou via um retransmissor)
@@ -568,6 +748,15 @@ async function onSignal(from, d) {
     return en && en.sid === sid ? en : null;
   };
   switch (d.k) {
+    case 'rx': {
+      // um amigo contando o que recebe da minha tela (para a minha prévia imitar)
+      if (o !== S.me || !S.peers.has(from)) return;
+      const num = (x, max) => Math.max(0, Math.min(max, Number(x) || 0));
+      const prev = rxReports.get(from);
+      const frz = num(d.frz, 1e6);
+      rxReports.set(from, { fps: num(d.fps, 240), h: num(d.h, 4320), frz, frzNew: prev ? Math.max(0, frz - prev.frz) : 0, at: Date.now() });
+      return;
+    }
     case 'sub':
       await onSubRequest(kind, o, from, sid);
       break;
@@ -809,7 +998,15 @@ function watch(id, simultaneous) {
   render();
 }
 
+// Com 2 telas abertas, uma pode ocupar o palco inteiro (a outra segue conectada,
+// então "Ver as duas telas" volta na hora, sem recarregar)
+function setFocus(id) {
+  S.focus = id;
+  render();
+}
+
 function unwatch(id) {
+  if (S.focus === id) S.focus = null;
   subTries.delete(id);
   S.watched = S.watched.filter((x) => x !== id);
   if (id !== S.me) dropSub('screen', id, true);
@@ -821,6 +1018,7 @@ function render() {
   if (!S.room) return;
   S.watched = S.watched.filter(isLive);
   if (S.ws && S.watched.filter((id) => id !== S.me).join(',') !== S.sentWatching) pushState();
+  if (S.me) syncCams();
   renderMembers();
   renderStage();
   renderControls();
@@ -886,89 +1084,165 @@ function renderMembers() {
   $('#meLive').hidden = !S.self.live;
 }
 
-// ------------------------------------------------------------ diagnóstico
-// A cada 5s, durante uma transmissão, envia ao servidor números técnicos (nada
-// da imagem): fps, resolução, taxa, perdas, atraso e tipo de conexão de cada
-// envio/recepção. Servem para descobrir onde engasga numa chamada real.
-// Consulta: /diag?sala=<código da sala>
+// =============================================================== monitor único
+// Um único ciclo de 2s lê as estatísticas de cada conexão UMA vez e alimenta tudo:
+// indicador de fps, vigia de quem assiste, saúde da captura, prévia sincronizada,
+// recuperação de qualidade (10s) e diagnóstico (6s). Antes eram 4 timers, cada um
+// lendo as mesmas estatísticas de novo — mais processamento e mais lixo na memória.
+const subTries = new Map(); // tentativas seguidas de abrir a tela de alguém sem imagem
+const liveHealth = { capture: null, low: 0, slow: 0, slowWarned: false, warnedAt: 0, last: null };
+const rxReports = new Map(); // espectador -> o que ele está recebendo da MINHA tela
 const diagPrev = new WeakMap();
+let monitorTick = 0;
 
-async function pcDiag(en) {
-  const r = await en.pc.getStats();
-  let rtp = null;
-  let src = null;
-  let pair = null;
-  r.forEach((x) => {
-    if (x.kind === 'video' && (x.type === 'outbound-rtp' || x.type === 'inbound-rtp')) rtp = x;
-    if (x.type === 'media-source' && x.kind === 'video') src = x;
-    if (x.type === 'transport' && x.selectedCandidatePairId) pair = r.get(x.selectedCandidatePairId);
+// Extrai de um relatório só o que usamos
+function pickStats(report) {
+  const st = { rtp: null, src: null, pair: null, codec: null, conn: null };
+  report.forEach((x) => {
+    if (x.kind === 'video' && (x.type === 'outbound-rtp' || x.type === 'inbound-rtp')) st.rtp = x;
+    else if (x.type === 'media-source' && x.kind === 'video') st.src = x;
+    else if (x.type === 'transport' && x.selectedCandidatePairId) st.pair = report.get(x.selectedCandidatePairId);
   });
-  const o = {};
-  if (pair) {
-    const l = r.get(pair.localCandidateId);
-    const rm = r.get(pair.remoteCandidateId);
-    o.conexao = `${l ? l.candidateType : '?'}/${rm ? rm.candidateType : '?'}`; // relay = passou por TURN
-    if (pair.currentRoundTripTime != null) o.rtt_ms = Math.round(pair.currentRoundTripTime * 1000);
+  if (st.rtp && st.rtp.codecId) st.codec = (report.get(st.rtp.codecId) || {}).mimeType;
+  if (st.pair) {
+    const l = report.get(st.pair.localCandidateId);
+    const r = report.get(st.pair.remoteCandidateId);
+    st.conn = `${l ? l.candidateType : '?'}/${r ? r.candidateType : '?'}`; // relay = passou pelo TURN
   }
-  if (!rtp) return o;
-  const out = rtp.type === 'outbound-rtp';
-  const now = { t: performance.now(), bytes: out ? rtp.bytesSent : rtp.bytesReceived, frz: rtp.freezeCount || 0, lost: rtp.packetsLost || 0, rcv: rtp.packetsReceived || 0 };
-  const p = diagPrev.get(en.pc);
-  diagPrev.set(en.pc, now);
-  o.fps = rtp.framesPerSecond != null ? Math.round(rtp.framesPerSecond) : 0;
-  o.res = rtp.frameHeight ? `${rtp.frameHeight}p` : '-';
-  o.codec = (r.get(rtp.codecId) || {}).mimeType;
-  if (p) o.kbps = Math.round(((now.bytes - p.bytes) * 8) / (now.t - p.t));
-  if (out) {
-    o.limite = rtp.qualityLimitationReason; // bandwidth = internet, cpu = processador
-    if (rtp.framesEncoded) o.ms_por_quadro = +((rtp.totalEncodeTime / rtp.framesEncoded) * 1000).toFixed(1);
-    if (pair && pair.availableOutgoingBitrate) o.banda_disponivel_kbps = Math.round(pair.availableOutgoingBitrate / 1000);
-    if (src && src.framesPerSecond != null) o.captura_fps = Math.round(src.framesPerSecond);
-  } else {
-    if (p) {
-      o.travadas_5s = now.frz - p.frz;
-      const lost = now.lost - p.lost;
-      const got = now.rcv - p.rcv;
-      o.perda_pct = lost + got > 0 ? +((lost * 100) / (lost + got)).toFixed(1) : 0;
-    }
-    if (rtp.jitter != null) o.jitter_ms = Math.round(rtp.jitter * 1000);
-    if (rtp.jitterBufferEmittedCount) o.buffer_ms = Math.round((rtp.jitterBufferDelay / rtp.jitterBufferEmittedCount) * 1000);
-  }
-  return o;
+  return st;
 }
 
 setInterval(async () => {
-  if (!S.ws || !S.me) return;
-  const nickOf = (id) => (id === S.me ? S.nick : (S.peers.get(id) || {}).nick || id);
-  const envia = [];
-  const recebe = [];
-  for (const en of [...S.pcs.values()]) {
-    if (en.kind !== 'screen') continue;
-    try {
-      const o = await pcDiag(en);
-      if (en.role === 'pub') envia.push({ para: nickOf(en.peer), tela: en.o === S.me ? 'minha' : `${nickOf(en.o)} (repasse)`, ...o });
-      else recebe.push({ tela_de: nickOf(en.o), via: nickOf(en.peer), ...o });
-    } catch {}
-  }
-  if (!envia.length && !recebe.length && !S.self.live) return;
-  const v = S.screenStream && S.screenStream.getVideoTracks()[0];
-  send({
-    t: 'diag',
-    d: {
-      celular: IS_MOBILE,
-      nucleos: navigator.hardwareConcurrency,
-      transmitindo: S.self.live ? `${qualityLabel()} · ${v ? v.getSettings().displaySurface : '?'} · captura ${liveHealth.capture}fps · som: ${S.shareAudioLabel || 'nenhum'}` : undefined,
-      envia,
-      recebe,
-    },
-  });
-}, 5000);
+  monitorTick++;
+  const list = [...S.pcs.values()];
+  await Promise.all(list.map(async (en) => {
+    try { en.st = pickStats(await en.pc.getStats()); } catch {}
+  }));
+  watchViewers();
+  checkMyCapture();
+  if (monitorTick % 5 === 0) recoverQuality();
+  if (monitorTick % 3 === 0) sendDiag();
+}, 2000);
 
-// ------------------------------------------- qualidade constante no longo prazo
+// ---- quem assiste: indicador, vigia de "carregando" e relatório para quem transmite
+//  - nenhuma imagem em 8s desde que pediu a tela → refaz a conexão (vem imagem nova)
+//  - conexão caída por mais de 6s → refaz (reserva; o normal é o aviso de 3s em subscribe)
+//  Não dá para usar "parou de chegar pacote": com a tela parada nenhum pacote chega.
+function watchViewers() {
+  const now = performance.now();
+  for (const en of [...S.pcs.values()]) {
+    if (en.role !== 'sub' || en.kind !== 'screen' || !en.st) continue;
+    if (S.pcs.get(subKey('screen', en.o)) !== en) continue;
+    const inb = en.st.rtp;
+    if (inb && inb.frameHeight) en.stat = `${inb.frameHeight}p · ${Math.round(inb.framesPerSecond || 0)}fps`;
+    const decoded = inb ? inb.framesDecoded || 0 : 0;
+    if (decoded > 0 && subTries.has(en.o)) { subTries.delete(en.o); renderStage(); }
+
+    let restart = decoded === 0 && now - en.t0 > 8000;
+    if (en.pc.connectionState === 'disconnected') {
+      if (!en.discSince) en.discSince = now;
+      if (now - en.discSince > 6000) restart = true;
+    } else en.discSince = 0;
+    if (restart && wanted('screen', en.o)) {
+      subTries.set(en.o, (subTries.get(en.o) || 0) + 1);
+      resubscribe('screen', en.o, 200);
+      continue;
+    }
+    // Conta ao dono da tela o que estou recebendo: a prévia dele imita isso
+    if (decoded > 0) {
+      relay(en.o, { k: 'rx', kind: 'screen', o: en.o, fps: Math.round(inb.framesPerSecond || 0), h: inb.frameHeight || 0, frz: inb.freezeCount || 0 });
+    }
+    const t = tiles.get(`s:${en.o}`);
+    if (t) showStat(t, en.o);
+  }
+}
+
+// ---- quem transmite: saúde da captura + prévia igual à dos amigos
+// Testado: ao transmitir uma JANELA coberta ou minimizada, o Windows/o programa
+// para de desenhá-la e a captura cai para ~1fps (parece congelado).
+function checkMyCapture() {
+  const v = S.screenStream && S.screenStream.getVideoTracks()[0];
+  if (!v) {
+    Object.assign(liveHealth, { capture: null, low: 0, slow: 0, slowWarned: false, last: null });
+    rxReports.clear();
+    return;
+  }
+  let fps = null;
+  const en = children('screen', S.me)[0];
+  if (en && en.st && en.st.src && en.st.src.framesPerSecond != null) fps = en.st.src.framesPerSecond;
+  if (fps == null && v.stats && typeof v.stats.totalFrames === 'number') {
+    // ninguém assistindo: usa o contador do próprio track (Chrome)
+    const now = { t: performance.now(), n: v.stats.totalFrames };
+    if (liveHealth.last) fps = Math.round(((now.n - liveHealth.last.n) * 1000) / (now.t - liveHealth.last.t));
+    liveHealth.last = now;
+  }
+  if (fps != null) {
+    liveHealth.capture = Math.round(fps);
+    const surface = (v.getSettings && v.getSettings().displaySurface) || '';
+    liveHealth.low = surface === 'window' && fps < 4 ? liveHealth.low + 1 : 0;
+    if (liveHealth.low >= 3 && Date.now() - liveHealth.warnedAt > 60000) {
+      liveHealth.warnedAt = Date.now();
+      toast('A janela que você está transmitindo parou de ser desenhada (está coberta ou minimizada) e a transmissão congela. Deixe-a visível na tela ou transmita a "Tela inteira".', 9000);
+    }
+    // Janela visível = ~58fps; coberta ou fora de foco, muitos programas (e jogos com
+    // "limite de FPS em segundo plano") passam a desenhar bem menos.
+    const slow = surface === 'window' && fps >= 4 && fps < S.quality.fps * 0.5;
+    liveHealth.slow = slow ? liveHealth.slow + 1 : 0;
+    if (liveHealth.slow >= 5 && !liveHealth.slowWarned) {
+      liveHealth.slowWarned = true;
+      toast(`A janela está entregando só ${Math.round(fps)}fps. Se ela estiver atrás de outra janela ou fora de foco, o programa desenha menos (muitos jogos limitam o FPS em segundo plano). Para ficar fluido: deixe a janela visível ou use "Tela inteira".`, 10000);
+    }
+  }
+  syncPreview();
+  renderMembers();
+}
+
+// O pior caso entre os amigos (relatórios com mais de 6s são descartados)
+function previewTarget() {
+  const now = Date.now();
+  let out = null;
+  for (const [id, r] of [...rxReports]) {
+    if (now - r.at > 6000 || !S.peers.has(id)) { rxReports.delete(id); continue; }
+    if (!out) out = { fps: r.fps, h: r.h, n: 0, frz: 0 };
+    out.fps = Math.min(out.fps, r.fps);
+    out.h = Math.min(out.h, r.h || out.h);
+    out.frz += r.frzNew;
+    out.n++;
+  }
+  return out;
+}
+
+// A prévia de quem transmite mostra a mesma fluidez e resolução que os amigos
+// recebem. A proporção (recebido ÷ capturado) evita falso alarme com a tela
+// parada: aí a captura também entrega pouco e a prévia segue no fps cheio.
+function syncPreview() {
+  const tr = S.previewStream && S.previewStream.getVideoTracks()[0];
+  if (!tr) { S.previewApplied = null; return; }
+  const tgt = previewTarget();
+  const cap = Math.max(1, liveHealth.capture || S.quality.fps);
+  const ratio = tgt ? Math.min(1, tgt.fps / cap) : 1;
+  const fps = Math.max(5, Math.round(S.quality.fps * ratio));
+  const h = tgt && tgt.h ? Math.max(240, Math.min(tgt.h, QUALITY[S.quality.res].h)) : QUALITY[S.quality.res].h;
+  const cur = S.previewApplied || {};
+  if (Math.abs((cur.fps || 0) - fps) >= 3 || Math.abs((cur.h || 0) - h) >= 60) {
+    S.previewApplied = { fps, h };
+    tr.applyConstraints({ height: { max: h }, width: { max: Math.round((h * 16) / 9) }, frameRate: { max: fps } }).catch(() => {});
+  }
+  const t = tiles.get(`s:${S.me}`);
+  if (t) showStat(t, S.me);
+}
+
+function previewLabel() {
+  const tgt = previewTarget();
+  if (!tgt) return 'ninguém assistindo ainda';
+  const who = tgt.n === 1 ? 'seu amigo recebe' : `seus ${tgt.n} amigos recebem (pior caso)`;
+  return `${who}: ${tgt.h}p · ${Math.round(tgt.fps)}fps${tgt.frz ? ' · ⚠ travou' : ''}`;
+}
+
+// ---- qualidade constante no longo prazo (a cada 10s)
 // Quando a internet ou o processador apertam, o navegador reduz a resolução para
-// manter o fps — mas nem sempre volta a subir depois, e a transmissão ia ficando
-// pior com o tempo. A cada 10s: se a resolução está reduzida há 30s e já sobra
-// banda E processador, libera o navegador para voltar à qualidade cheia.
+// manter o fps — mas nem sempre volta a subir depois. Se a resolução está reduzida
+// há 30s e já sobra banda E processador, libera o navegador para voltar ao cheio.
 async function resetAdaptation(sender) {
   // trocar a preferência passando por "balanced" zera as reduções acumuladas
   for (const pref of ['balanced', 'maintain-framerate']) {
@@ -980,92 +1254,104 @@ async function resetAdaptation(sender) {
   }
 }
 
-setInterval(async () => {
+function recoverQuality() {
   for (const en of children('screen', S.me)) {
     const sender = en.pc.getSenders().find((x) => x.track && x.track.kind === 'video');
-    if (!sender) continue;
-    try {
-      const r = await sender.getStats();
-      let out = null;
-      let pair = null;
-      r.forEach((x) => {
-        if (x.type === 'outbound-rtp') out = x;
-        if (x.type === 'transport' && x.selectedCandidatePairId) pair = r.get(x.selectedCandidatePairId);
-      });
-      if (!out || !out.frameHeight) continue;
-      const prev = en.ad || { enc: out.totalEncodeTime || 0, frames: out.framesEncoded || 0, low: 0 };
-      const dFrames = (out.framesEncoded || 0) - prev.frames;
-      const msPerFrame = dFrames > 0 ? (((out.totalEncodeTime || 0) - prev.enc) * 1000) / dFrames : 0;
-      const capH = Math.min(QUALITY[S.quality.res].h, sender.track.getSettings().height || 9999);
-      const reduced = out.frameHeight < capH * 0.8;
-      const bandOk = pair && pair.availableOutgoingBitrate && pair.availableOutgoingBitrate >= screenBitrate(S.me) * 0.9;
-      const cpuOk = msPerFrame > 0 && msPerFrame < (1000 / S.quality.fps) * 0.6;
-      const low = reduced && bandOk && cpuOk ? prev.low + 1 : 0;
-      en.ad = { enc: out.totalEncodeTime || 0, frames: out.framesEncoded || 0, low };
-      if (low >= 3) {
-        en.ad.low = 0;
-        await resetAdaptation(sender);
-      }
-    } catch {}
+    const out = en.st && en.st.rtp;
+    if (!sender || !out || !out.frameHeight) continue;
+    const pair = en.st.pair;
+    const prev = en.ad || { enc: out.totalEncodeTime || 0, frames: out.framesEncoded || 0, low: 0 };
+    const dFrames = (out.framesEncoded || 0) - prev.frames;
+    const msPerFrame = dFrames > 0 ? (((out.totalEncodeTime || 0) - prev.enc) * 1000) / dFrames : 0;
+    const capH = Math.min(QUALITY[S.quality.res].h, sender.track.getSettings().height || 9999);
+    const reduced = out.frameHeight < capH * 0.8;
+    const bandOk = pair && pair.availableOutgoingBitrate && pair.availableOutgoingBitrate >= screenBitrate(S.me) * 0.9;
+    const cpuOk = msPerFrame > 0 && msPerFrame < (1000 / S.quality.fps) * 0.6;
+    const low = reduced && bandOk && cpuOk ? prev.low + 1 : 0;
+    en.ad = { enc: out.totalEncodeTime || 0, frames: out.framesEncoded || 0, low };
+    if (low >= 3) {
+      en.ad.low = 0;
+      resetAdaptation(sender);
+    }
   }
-}, 10000);
+}
 
-// ------------------------------------------------ saúde da minha transmissão
-// Mede quantos quadros por segundo a captura está entregando. Testado: ao
-// transmitir uma JANELA que fica coberta ou minimizada, o Windows/o próprio
-// programa para de desenhá-la e a captura cai para ~1fps (parece congelado).
-const liveHealth = { capture: null, low: 0, warnedAt: 0, last: null };
+// ---- diagnóstico (a cada 6s, só com transmissão rolando)
+// Números técnicos (nada da imagem) para descobrir onde engasga numa chamada real.
+// Consulta: /diag?sala=<código da sala>
+function pcDiag(en) {
+  const o = {};
+  const st = en.st;
+  if (!st) return o;
+  if (st.conn) o.conexao = st.conn;
+  if (st.pair && st.pair.currentRoundTripTime != null) o.rtt_ms = Math.round(st.pair.currentRoundTripTime * 1000);
+  const rtp = st.rtp;
+  if (!rtp) return o;
+  const out = rtp.type === 'outbound-rtp';
+  const now = { t: performance.now(), bytes: out ? rtp.bytesSent : rtp.bytesReceived, frz: rtp.freezeCount || 0, lost: rtp.packetsLost || 0, rcv: rtp.packetsReceived || 0 };
+  const p = diagPrev.get(en.pc);
+  diagPrev.set(en.pc, now);
+  o.fps = rtp.framesPerSecond != null ? Math.round(rtp.framesPerSecond) : 0;
+  o.res = rtp.frameHeight ? `${rtp.frameHeight}p` : '-';
+  o.codec = st.codec;
+  if (p) o.kbps = Math.round(((now.bytes - p.bytes) * 8) / (now.t - p.t));
+  if (out) {
+    o.limite = rtp.qualityLimitationReason; // bandwidth = internet, cpu = processador
+    if (rtp.framesEncoded) o.ms_por_quadro = +((rtp.totalEncodeTime / rtp.framesEncoded) * 1000).toFixed(1);
+    if (st.pair && st.pair.availableOutgoingBitrate) o.banda_disponivel_kbps = Math.round(st.pair.availableOutgoingBitrate / 1000);
+    if (st.src && st.src.framesPerSecond != null) o.captura_fps = Math.round(st.src.framesPerSecond);
+  } else {
+    if (p) {
+      o.travadas = now.frz - p.frz;
+      const lost = now.lost - p.lost;
+      const got = now.rcv - p.rcv;
+      o.perda_pct = lost + got > 0 ? +((lost * 100) / (lost + got)).toFixed(1) : 0;
+    }
+    if (rtp.jitter != null) o.jitter_ms = Math.round(rtp.jitter * 1000);
+    if (rtp.jitterBufferEmittedCount) o.buffer_ms = Math.round((rtp.jitterBufferDelay / rtp.jitterBufferEmittedCount) * 1000);
+  }
+  return o;
+}
 
-setInterval(async () => {
+function sendDiag() {
+  if (!S.ws || !S.me) return;
+  const nickOf = (id) => (id === S.me ? S.nick : (S.peers.get(id) || {}).nick || id);
+  const envia = [];
+  const recebe = [];
+  for (const en of S.pcs.values()) {
+    if (en.kind !== 'screen') continue;
+    const o = pcDiag(en);
+    if (en.role === 'pub') envia.push({ para: nickOf(en.peer), tela: en.o === S.me ? 'minha' : `${nickOf(en.o)} (repasse)`, ...o });
+    else recebe.push({ tela_de: nickOf(en.o), via: nickOf(en.peer), ...o });
+  }
+  if (!envia.length && !recebe.length && !S.self.live) return;
   const v = S.screenStream && S.screenStream.getVideoTracks()[0];
-  if (!v) { liveHealth.capture = null; liveHealth.low = 0; liveHealth.slow = 0; liveHealth.slowWarned = false; liveHealth.last = null; return; }
-  let fps = null;
-  const en = children('screen', S.me)[0];
-  if (en) {
-    try {
-      const s = en.pc.getSenders().find((x) => x.track && x.track.kind === 'video');
-      (await s.getStats()).forEach((r) => { if (r.type === 'media-source' && r.framesPerSecond != null) fps = r.framesPerSecond; });
-    } catch {}
-  }
-  if (fps == null && v.stats && typeof v.stats.totalFrames === 'number') {
-    // ninguém assistindo: usa o contador do próprio track (Chrome)
-    const now = { t: performance.now(), n: v.stats.totalFrames };
-    if (liveHealth.last) fps = Math.round(((now.n - liveHealth.last.n) * 1000) / (now.t - liveHealth.last.t));
-    liveHealth.last = now;
-  }
-  if (fps == null) return;
-  liveHealth.capture = Math.round(fps);
-
-  const surface = (v.getSettings && v.getSettings().displaySurface) || '';
-  liveHealth.low = surface === 'window' && fps < 4 ? liveHealth.low + 1 : 0;
-  if (liveHealth.low >= 3 && Date.now() - liveHealth.warnedAt > 60000) {
-    liveHealth.warnedAt = Date.now();
-    toast('A janela que você está transmitindo parou de ser desenhada (está coberta ou minimizada) e a transmissão congela. Deixe-a visível na tela ou transmita a "Tela inteira".', 9000);
-  }
-  // Testado: janela visível = ~58fps; coberta ou fora de foco, muitos programas
-  // (e jogos com "limite de FPS em segundo plano") passam a desenhar bem menos.
-  const slow = surface === 'window' && fps >= 4 && fps < S.quality.fps * 0.5;
-  liveHealth.slow = slow ? (liveHealth.slow || 0) + 1 : 0;
-  if (liveHealth.slow >= 5 && !liveHealth.slowWarned) {
-    liveHealth.slowWarned = true;
-    toast(`A janela está entregando só ${Math.round(fps)}fps. Se ela estiver atrás de outra janela ou fora de foco, o programa desenha menos (muitos jogos limitam o FPS em segundo plano). Para ficar fluido: deixe a janela visível ou use "Tela inteira".`, 10000);
-  }
-  renderMembers();
-}, 2000);
+  send({
+    t: 'diag',
+    d: {
+      celular: IS_MOBILE,
+      nucleos: navigator.hardwareConcurrency,
+      memoria_gb: navigator.deviceMemory,
+      transmitindo: S.self.live ? `${qualityLabel()} · ${v ? v.getSettings().displaySurface : '?'} · captura ${liveHealth.capture}fps · som: ${S.shareAudioLabel || 'nenhum'}` : undefined,
+      envia,
+      recebe,
+    },
+  });
+}
 
 // Tiles são reaproveitados entre renders (vídeos não são recriados)
 const tiles = new Map();
 
-// Prévia local: cópia da faixa no mesmo fps da transmissão (fluida), mas em
-// 540p para pesar pouco. A transmissão enviada aos amigos continua na qualidade escolhida.
+// Prévia local: cópia da faixa (não passa por codificação, então é leve).
+// syncPreview() ajusta fps e resolução para ficar igual ao que os amigos recebem.
 function selfPreview() {
   if (!S.screenStream) return null;
   if (!S.previewStream) {
     const v = S.screenStream.getVideoTracks()[0];
     if (!v) return null;
-    const c = v.clone();
-    c.applyConstraints({ width: { max: 960 }, height: { max: 540 }, frameRate: { max: S.quality.fps } }).catch(() => {});
-    S.previewStream = new MediaStream([c]);
+    S.previewStream = new MediaStream([v.clone()]);
+    S.previewApplied = null;
+    syncPreview();
   }
   return S.previewStream;
 }
@@ -1074,6 +1360,7 @@ function dropPreview() {
   if (!S.previewStream) return;
   S.previewStream.getTracks().forEach((t) => t.stop());
   S.previewStream = null;
+  S.previewApplied = null;
 }
 
 function streamFor(kind, id) {
@@ -1111,8 +1398,16 @@ function makeTile(k) {
   t._video = v;
   t._ui = rest;
   t.dataset.key = k;
+  v.disableRemotePlayback = true;
   v.addEventListener('playing', () => t.classList.remove('loading'));
-  v.addEventListener('dblclick', () => toggleFullscreen(t));
+  // 1 clique (com 2 telas abertas): amplia esta tela. 2 cliques: tela cheia.
+  let clickTimer = 0;
+  v.addEventListener('click', () => {
+    if (!t.classList.contains('can-focus')) return;
+    clearTimeout(clickTimer);
+    clickTimer = setTimeout(() => setFocus(k.slice(2)), 250);
+  });
+  v.addEventListener('dblclick', () => { clearTimeout(clickTimer); toggleFullscreen(t); });
   tiles.set(k, t);
   return t;
 }
@@ -1121,24 +1416,41 @@ function setUI(t, html) {
   if (t._ui._html !== html) { t._ui.innerHTML = html; t._ui._html = html; }
 }
 
+// Volume de cada transmissão (0 a 1), escolhido por quem assiste
+function volumeOf(id) { return S.volumes.has(id) ? S.volumes.get(id) : 1; }
+
 function updateScreenTile(t, id) {
   const p = info(id);
   const stream = streamFor('screen', id);
-  const muted = p.me || S.muted.has(id);
-  t.className = 'tile screen is-live';
+  const vol = volumeOf(id);
+  const muted = p.me || S.muted.has(id) || vol === 0;
+  const many = S.watched.filter(isLive).length > 1;
+  const focused = many && S.focus === id;
+  t.className = `tile screen is-live${many && !focused ? ' can-focus' : ''}`;
   const hasAudio = !!(stream && stream.getAudioTracks().length);
   if (!stream || !stream.getVideoTracks().some((tr) => tr.readyState === 'live') || t._video.readyState < 2) t.classList.add('loading');
   setVideo(t._video, stream, muted);
+  t._video.volume = vol;
   const tries = subTries.get(id) || 0;
   setUI(t, `<div class="t-spinner"></div>
-    ${tries >= 2 ? `<div class="t-msg">Reconectando à tela de ${esc(p.nick)} (tentativa ${tries + 1})…<br><small>Se não abrir, a rede de um de vocês pode estar bloqueando a conexão direta.</small></div>` : ''}
+    ${tries >= 2 ? `<div class="t-msg">Reconectando à tela de ${esc(p.nick)} (tentativa ${tries + 1})…<br><small>${S.hasTurn
+      ? 'A conexão está demorando. Verifique a internet de vocês dois.'
+      : 'A rede de um de vocês bloqueia a conexão direta. O dono do site precisa ativar o servidor TURN (veja o README).'}</small></div>` : ''}
+    ${focused ? `<button class="t-pill" data-act="unfocus">${icon('layers')}<span>Ver as duas telas</span></button>` : ''}
     <div class="t-top">
-      ${hasAudio && !p.me ? `<button class="t-btn" data-act="mute" data-id="${id}" title="${muted ? 'Ativar som' : 'Silenciar'}">${icon(muted ? 'mute' : 'speaker')}</button>` : ''}
+      ${hasAudio && !p.me ? `<div class="t-vol">
+        <button class="t-btn" data-act="mute" data-id="${id}" title="${muted ? 'Ativar som' : 'Silenciar'}">${icon(muted ? 'mute' : 'speaker')}</button>
+        <input class="vol-range" type="range" min="0" max="100" step="1" data-id="${id}" aria-label="Volume da transmissão">
+      </div>` : ''}
+      ${many && !focused ? `<button class="t-btn" data-act="focus" data-id="${id}" title="Ampliar esta tela">${icon('expand')}</button>` : ''}
       <button class="t-btn" data-act="fullscreen" title="Tela cheia">${icon('full')}</button>
-      <button class="t-btn stop" data-act="unwatch" data-id="${id}" title="Parar de assistir">${icon('x')} Parar de assistir</button>
+      <button class="t-btn stop" data-act="unwatch" data-id="${id}" title="Parar de assistir">${icon('x')}<span class="lbl">Parar de assistir</span></button>
     </div>
-    <div class="t-label">${icon('screen')}<span>${esc(p.nick)}${p.me ? ' (você)' : ''}</span><span class="live-badge">AO VIVO</span>${p.me ? `<span class="q">sua prévia · 540p ${S.quality.fps}fps</span>` : '<span class="q live-stat"></span>'}</div>`);
-  if (!p.me) showStat(t, id);
+    <div class="t-label">${icon('screen')}<span>${esc(p.nick)}${p.me ? ' (sua prévia)' : ''}</span><span class="live-badge">AO VIVO</span><span class="q live-stat"></span></div>`);
+  // o valor do volume não entra no HTML, senão o controle seria recriado enquanto arrasta
+  const range = t.querySelector('.vol-range');
+  if (range && document.activeElement !== range) range.value = Math.round(vol * 100);
+  showStat(t, id);
 }
 
 // Mostra no quadro o que está chegando de verdade (resolução e fps recebidos).
@@ -1146,49 +1458,10 @@ function updateScreenTile(t, id) {
 function showStat(t, id) {
   const el = t.querySelector('.live-stat');
   if (!el) return;
+  if (id === S.me) { el.textContent = previewLabel(); return; }
   const en = S.pcs.get(subKey('screen', id));
   el.textContent = en && en.stat ? en.stat : (info(id).q || '');
 }
-
-// Tentativas seguidas de abrir a tela de cada pessoa sem conseguir imagem
-const subTries = new Map();
-
-// A cada 2s: atualiza o indicador e vigia quem assiste.
-//  - nenhuma imagem em 8s desde que pediu a tela → refaz a conexão (vem imagem nova)
-//  - conexão caída ("disconnected") por mais de 6s → refaz (reserva; o normal é
-//    o aviso de 3s em subscribe). Não dá para usar "parou de chegar pacote":
-//    com a tela parada, nenhum pacote chega e daria alarme falso.
-// Antes, a tela podia ficar "carregando" para sempre.
-setInterval(async () => {
-  for (const en of [...S.pcs.values()]) {
-    if (en.role !== 'sub' || en.kind !== 'screen') continue;
-    if (S.pcs.get(subKey('screen', en.o)) !== en) continue;
-    try {
-      const report = await en.pc.getStats();
-      let inb = null;
-      report.forEach((r) => { if (r.type === 'inbound-rtp' && r.kind === 'video') inb = r; });
-      if (inb && inb.frameHeight) en.stat = `${inb.frameHeight}p · ${Math.round(inb.framesPerSecond || 0)}fps`;
-      const now = performance.now();
-      const decoded = inb ? inb.framesDecoded || 0 : 0;
-      if (decoded > 0 && subTries.has(en.o)) { subTries.delete(en.o); renderStage(); }
-
-      let restart = false;
-      if (decoded === 0 && now - en.t0 > 8000) restart = true;
-      if (en.pc.connectionState === 'disconnected') {
-        if (!en.discSince) en.discSince = now;
-        if (now - en.discSince > 6000) restart = true;
-      } else en.discSince = 0;
-
-      if (restart && wanted('screen', en.o)) {
-        subTries.set(en.o, (subTries.get(en.o) || 0) + 1);
-        resubscribe('screen', en.o, 200);
-        continue;
-      }
-      const t = tiles.get(`s:${en.o}`);
-      if (t) showStat(t, en.o);
-    } catch {}
-  }
-}, 2000);
 
 // Aviso no lugar de uma tela que está ao vivo mas não está aberta
 function updateNoticeTile(t, id) {
@@ -1229,9 +1502,12 @@ function renderStage() {
   // Com alguém ao vivo, o palco se divide em partes iguais, uma por tela:
   // aberta = vídeo; não aberta = aviso com "Assistir".
   // Os membros vão para a fileira abaixo, só se o botão de pessoas estiver ligado.
+  // Tela ampliada: só vale com 2 telas abertas; ela ocupa o palco inteiro
+  if (S.focus && !(screens.length > 1 && screens.includes(S.focus))) S.focus = null;
   const plan = [];
   if (live.length) {
-    for (const id of live) {
+    if (S.focus) plan.push([stage, `s:${S.focus}`, updateScreenTile, S.focus]);
+    else for (const id of live) {
       if (screens.includes(id)) plan.push([stage, `s:${id}`, updateScreenTile, id]);
       else plan.push([stage, `n:${id}`, updateNoticeTile, id]);
     }
@@ -1268,7 +1544,7 @@ function renderStage() {
     pos.set(container, [...container.children].indexOf(t) + 1);
   }
 
-  stage.className = live.length ? `stage panels n${Math.min(live.length, 4)}` : 'stage grid';
+  stage.className = live.length ? `stage panels n${S.focus ? 1 : Math.min(live.length, 4)}` : 'stage grid';
   strip.hidden = !(live.length && S.showMembers);
   if (!screens.includes(S.me)) dropPreview();
   fitGrid();
@@ -1461,6 +1737,13 @@ async function copyLink() {
 // ------------------------------------------------------------------ sair
 function leaveRoom() {
   S.leaving = true;
+  clearTimeout(NET.timer);
+  NET.attempt = 0;
+  setNetBanner(false);
+  S.rewatch = null;
+  S.focus = null;
+  S.volumes.clear();
+  S.muted.clear();
   stopLive();
   if (S.camStream) { S.camStream.getTracks().forEach((t) => t.stop()); S.camStream = null; }
   for (const k of [...S.pcs.keys()]) closePc(k);
@@ -1556,12 +1839,34 @@ document.addEventListener('click', (e) => {
     case 'close-modal': closeModals(); break;
     case 'fullscreen': toggleFullscreen(b.closest('.tile')); break;
     case 'mute':
-      if (S.muted.has(id)) S.muted.delete(id);
-      else S.muted.add(id);
+      if (S.muted.has(id) || volumeOf(id) === 0) {
+        S.muted.delete(id);
+        if (volumeOf(id) === 0) S.volumes.set(id, 0.5);
+      } else S.muted.add(id);
       renderStage();
       break;
+    case 'focus': setFocus(id); break;
+    case 'unfocus': setFocus(null); break;
   }
 });
+
+// Volume: aplica direto no vídeo enquanto arrasta, sem redesenhar o quadro
+document.addEventListener('input', (e) => {
+  const r = e.target.closest('.vol-range');
+  if (!r) return;
+  const id = r.dataset.id;
+  const v = Number(r.value) / 100;
+  S.volumes.set(id, v);
+  if (v > 0) S.muted.delete(id);
+  const t = tiles.get(`s:${id}`);
+  if (!t) return;
+  t._video.volume = v;
+  t._video.muted = v === 0 || S.muted.has(id);
+  const btn = t.querySelector('.t-vol [data-act="mute"]');
+  if (btn) btn.innerHTML = icon(t._video.muted ? 'mute' : 'speaker');
+});
+// ao soltar o controle, sincroniza o resto da interface
+document.addEventListener('change', (e) => { if (e.target.closest('.vol-range')) renderStage(); });
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeModals();

@@ -204,14 +204,23 @@ img { -webkit-user-drag: none; user-select: none; }
 .member:hover .m-actions, .member:focus-within .m-actions { display: flex; }
 
 .live-badge {
+  position: relative;
   background: var(--red); color: #fff; font-size: 10px; font-weight: 700;
   padding: 1px 7px; border-radius: 4px; letter-spacing: .06em; white-space: nowrap;
-  animation: pulse 2s infinite;
 }
-@keyframes pulse {
-  0% { box-shadow: 0 0 0 0 rgba(227, 36, 43, .55); }
-  70% { box-shadow: 0 0 0 6px rgba(227, 36, 43, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(227, 36, 43, 0); }
+/* Pulso do "AO VIVO": anima só transform/opacity de um anel à parte, que a placa
+   de vídeo faz sozinha. Antes animava box-shadow, que repinta a página o tempo todo. */
+.live-badge::after, .up-live::after, .ctrl.share.live::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  box-shadow: 0 0 0 2px rgba(227, 36, 43, .75);
+  animation: ring 2s ease-out infinite;
+}
+@keyframes ring {
+  0% { transform: scale(1); opacity: .9; }
+  70%, 100% { transform: scale(1.3, 1.6); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-badge::after, .up-live::after, .ctrl.share.live::after { animation: none; opacity: 0; }
 }
 
 .mini {
@@ -258,7 +267,7 @@ img { -webkit-user-drag: none; user-select: none; }
 .up-live {
   display: inline-flex; align-items: center; gap: 6px; flex: none;
   background: var(--red); color: #fff; font-size: 11px; font-weight: 700; letter-spacing: .06em;
-  padding: 5px 9px; border-radius: 6px; animation: pulse 2s infinite;
+  position: relative; padding: 5px 9px; border-radius: 6px;
 }
 
 .avatar {
@@ -290,20 +299,33 @@ img { -webkit-user-drag: none; user-select: none; }
 }
 .mobile-only { display: none; }
 
-/* Palco com moldura chanfrada */
+/* Palco com moldura chanfrada.
+   Desempenho: brilho (filter) e cantos (clip-path) ficam em camadas de FUNDO
+   (pseudo-elementos estáticos, pintados uma vez só). Antes eles envolviam o
+   vídeo, e o navegador redesenhava brilho e cantos a cada quadro do vídeo. */
 .stage-wrap { flex: 1; min-height: 0; padding: 18px 18px 10px; display: flex; }
-.stage-glow { flex: 1; min-width: 0; display: flex; filter: drop-shadow(0 0 14px rgba(227, 36, 43, .25)); }
-.stage-frame {
-  flex: 1; min-width: 0; display: flex; padding: 1.5px;
-  background: linear-gradient(160deg, var(--red-hi), rgba(120, 12, 18, .5) 30%, rgba(60, 6, 10, .45) 70%, var(--red-hi));
+.stage-glow { position: relative; flex: 1; min-width: 0; display: flex; }
+.stage-glow::before {
+  content: ""; position: absolute; inset: 4px; z-index: 0; pointer-events: none;
+  background: rgba(227, 36, 43, .32); filter: blur(14px);
+}
+.stage-frame { position: relative; flex: 1; min-width: 0; display: flex; isolation: isolate; }
+.stage-frame::before, .stage-frame::after {
+  content: ""; position: absolute; z-index: 0; pointer-events: none;
   clip-path: polygon(var(--cut) 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, var(--cut) 100%, 0 calc(100% - var(--cut)), 0 var(--cut));
 }
-.stage {
-  position: relative; flex: 1; min-width: 0; min-height: 0; padding: 14px; display: grid; gap: 12px;
+.stage-frame::before {
+  inset: 0;
+  background: linear-gradient(160deg, var(--red-hi), rgba(120, 12, 18, .5) 30%, rgba(60, 6, 10, .45) 70%, var(--red-hi));
+}
+.stage-frame::after {
+  inset: 1.5px;
   background:
     linear-gradient(rgba(5, 5, 7, .86), rgba(5, 5, 7, .9)),
     #070708 url('assets/background.png') center / cover no-repeat;
-  clip-path: polygon(var(--cut) 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, var(--cut) 100%, 0 calc(100% - var(--cut)), 0 var(--cut));
+}
+.stage {
+  position: relative; z-index: 1; flex: 1; min-width: 0; min-height: 0; padding: 16px; display: grid; gap: 12px;
 }
 .stage.grid {
   --cols: 2; --tw: 320px;
@@ -376,6 +398,36 @@ img { -webkit-user-drag: none; user-select: none; }
   border: 3px solid rgba(255, 255, 255, .15); border-top-color: var(--red); animation: spin .8s linear infinite; display: none;
 }
 .tile.loading .t-spinner { display: block; }
+
+/* Volume da transmissão */
+.t-vol {
+  display: flex; align-items: center; gap: 2px; height: 34px; padding-right: 10px;
+  background: rgba(0, 0, 0, .72); border-radius: 7px;
+}
+.t-vol .t-btn { background: transparent; }
+.vol-range { width: 92px; height: 4px; accent-color: var(--red); cursor: pointer; }
+
+/* Com 2 telas: clicar amplia; no modo ampliado, botão para voltar às duas */
+.tile.can-focus video { cursor: zoom-in; }
+.t-pill {
+  position: absolute; bottom: 10px; right: 10px; z-index: 2;
+  display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 14px; border-radius: 999px;
+  background: rgba(0, 0, 0, .78); color: #fff; font-size: 12.5px; font-weight: 600;
+  border: 1px solid var(--line-red);
+}
+.t-pill:hover { background: var(--red); border-color: var(--red); }
+
+/* Aviso de reconexão */
+.net-banner {
+  position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 70;
+  display: flex; align-items: center; gap: 10px; padding: 9px 16px; border-radius: 999px;
+  background: #1a1a1f; border: 1px solid var(--line-red); color: #fff; font-size: 13px; font-weight: 600;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .5);
+}
+.net-spin {
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, .2); border-top-color: var(--red); animation: spin .8s linear infinite;
+}
 .t-msg {
   position: absolute; top: calc(50% + 34px); left: 50%; transform: translateX(-50%); width: min(90%, 420px);
   text-align: center; font-size: 13px; color: #e6e6ea; display: none;
@@ -424,7 +476,7 @@ img { -webkit-user-drag: none; user-select: none; }
 .ctrl.active { border-color: var(--red); color: var(--red-hi); box-shadow: 0 0 0 3px rgba(227, 36, 43, .15); }
 .ctrl.share, .ctrl.leave { background: var(--red); border-color: var(--red); color: #fff; box-shadow: 0 6px 20px rgba(227, 36, 43, .35); }
 .ctrl.share:hover, .ctrl.leave:hover { background: var(--red-hi); }
-.ctrl.share.live { animation: pulse 2s infinite; }
+.ctrl.share.live { position: relative; }
 
 /* Chat */
 .chat {
@@ -544,6 +596,9 @@ img { -webkit-user-drag: none; user-select: none; }
   .strip { height: 92px; justify-content: flex-start; padding: 4px 10px 6px; }
   .strip .tile { width: 140px; }
   .t-top { opacity: 1; }
+  .t-btn .lbl { display: none; }
+  .vol-range { width: 56px; }
+  .t-pill span { display: none; }
   .ctrl { width: 48px; height: 48px; font-size: 17px; }
   .controls { gap: 12px; }
 }
